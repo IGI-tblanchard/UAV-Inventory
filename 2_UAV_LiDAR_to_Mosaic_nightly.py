@@ -7,8 +7,8 @@ import arcpy
 
 # ---- configuration ----
 BASE_DIR = Path(r"P:\IGG\Z_Drive")
-STAGING_GDB = Path(r"P:\IGG\Z_Drive\Staging\UAV_LiDAR_Staging.gdb")
-PRODUCTION_GDB = Path(r"P:\IGG\Z_Drive\UAV_LiDAR_Mosaics.gdb")
+STAGING_GDB = Path(r"P:\IGG\Z_Drive\Staging\UAV_Staging.gdb")
+PRODUCTION_GDB = Path(r"P:\IGG\Z_Drive\UAV_Mosaics.gdb")
 CLIENT_FOLDERS = {
     "CVE": "Cenovus",
     "TOU": "Tourmaline",

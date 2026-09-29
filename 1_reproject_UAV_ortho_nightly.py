@@ -1,0 +1,367 @@
+"""Rename and reproject client UAV orthomosaics to Cloud Optimized GeoTIFFs."""
+
+import csv
+import math
+import re
+from datetime import date, datetime
+from pathlib import Path
+
+from osgeo import gdal, osr
+
+# ---- configuration ----
+BASE_DIR = Path(r"P:\IGG\Z_Drive")
+CLIENT_FOLDERS = {
+	"CVE": "Cenovus",
+	"TOU": "Tourmaline",
+	"WCP": "Whitecap",
+}
+SOURCE_SUBDIRECTORY = "Imagery/UAV"
+SOURCE_ORTHO_FOLDER = "Orthomosaic"
+REPORT_CSV = Path(r"c:\Users\tblanchard\Documents\Tracy\Code\UAV Updates\4_reproject_ortho_report.csv")
+RENAME_REPORT_CSV = Path(r"c:\Users\tblanchard\Documents\Tracy\Code\UAV Updates\4_reproject_ortho_rename_report.csv")
+DRY_RUN = False
+
+MONTHS = {
+	"jan": "01",
+	"feb": "02",
+	"mar": "03",
+	"apr": "04",
+	"may": "05",
+	"jun": "06",
+	"jul": "07",
+	"aug": "08",
+	"sep": "09",
+	"oct": "10",
+	"nov": "11",
+	"dec": "12",
+}
+
+DATE_NAME_PATTERNS = (
+	re.compile(
+		r"(?P<month>[A-Za-z]{3})[- ](?P<day>\d{1,2})[- ](?P<year>\d{4})"
+		r"(?:[- _]*(?P<embedded_type>Mosaic|Orthomosaic|Ortho))?(?P<suffix>(?:[- _]+.+)?)$",
+		re.IGNORECASE,
+	),
+	re.compile(
+		r"(?P<day>\d{1,2})[- ](?P<month>[A-Za-z]{3})[- ](?P<year>\d{4})"
+		r"(?:[- _]*(?P<embedded_type>Mosaic|Orthomosaic|Ortho))?(?P<suffix>(?:[- _]+.+)?)$",
+		re.IGNORECASE,
+	),
+)
+CANONICAL_NAME_PATTERN = re.compile(
+	r"^(?P<day>\d{2})-(?P<month>\d{2})-(?P<year>\d{4})-Mosaic(?P<suffix>(?:-.+)?)$",
+	re.IGNORECASE,
+)
+
+TARGET_CRS_CODE = "EPSG:2955"  # NAD83(CSRS) UTM Zone 11N
+RESAMPLING = gdal.GRA_Bilinear
+
+gdal.UseExceptions()
+gdal.SetConfigOption("GDAL_PAM_ENABLED", "NO")
+gdal.SetConfigOption("GDAL_CACHEMAX", "1024")
+gdal.SetConfigOption("GDAL_NUM_THREADS", "ALL_CPUS")
+
+
+def create_cog_from_tif(src_tif_path, output_path, target_crs_code):
+	"""Reproject an orthomosaic while retaining its source pixel type and bands."""
+	try:
+		src_ds = gdal.Open(str(src_tif_path))
+		if src_ds is None:
+			print(f"ERROR: Could not open raster dataset: {src_tif_path}")
+			return False
+
+		src_crs = osr.SpatialReference(wkt=src_ds.GetProjection())
+		src_crs_name = (
+			src_crs.GetAttrValue("PROJCS")
+			or src_crs.GetAttrValue("GEOGCS")
+			or "UNKNOWN"
+		)
+		src_nodata = src_ds.GetRasterBand(1).GetNoDataValue()
+		print(f"REPROJECT: {src_tif_path}")
+		print(f"Input CRS: {src_crs_name} -- Output CRS: {target_crs_code}")
+
+		dst_crs = osr.SpatialReference()
+		dst_crs.ImportFromEPSG(int(target_crs_code.split(":")[1]))
+		vrt_ds = gdal.AutoCreateWarpedVRT(
+			src_ds, None, dst_crs.ExportToWkt(), RESAMPLING
+		)
+		if vrt_ds is None:
+			print(f"ERROR: Could not compute output dimensions for: {src_tif_path}")
+			src_ds = None
+			return False
+
+		width, height = vrt_ds.RasterXSize, vrt_ds.RasterYSize
+		geotransform = vrt_ds.GetGeoTransform()
+		x_res, y_res = abs(geotransform[1]), abs(geotransform[5])
+		vrt_ds = None
+		overview_count = (
+			max(1, math.ceil(math.log2(max(width, height) / 256)))
+			if max(width, height) > 256
+			else 1
+		)
+
+		warp_kwargs = {
+			"format": "COG",
+			"dstSRS": target_crs_code,
+			"resampleAlg": RESAMPLING,
+			"xRes": x_res,
+			"yRes": y_res,
+			"creationOptions": [
+				"COMPRESS=LZW",
+				"PREDICTOR=2",
+				"BLOCKSIZE=512",
+				f"OVERVIEW_COUNT={overview_count}",
+				"OVERVIEW_RESAMPLING=BILINEAR",
+				"NUM_THREADS=ALL_CPUS",
+				"BIGTIFF=IF_SAFER",
+				"STATISTICS=YES",
+			],
+			"callback": gdal.TermProgress_nocb,
+		}
+		if src_nodata is not None:
+			warp_kwargs["srcNodata"] = src_nodata
+
+		dst_ds = gdal.Warp(
+			str(output_path), src_ds, options=gdal.WarpOptions(**warp_kwargs)
+		)
+		src_ds = None
+		if dst_ds is None:
+			print(f"ERROR: Failed to create COG: {output_path}")
+			return False
+
+		for band_index in range(1, dst_ds.RasterCount + 1):
+			dst_ds.GetRasterBand(band_index).ComputeStatistics(False)
+		dst_ds.FlushCache()
+		dst_ds = None
+		return True
+
+	except Exception as error:
+		print(f"ERROR in create_cog_from_tif: {error}")
+		return False
+
+
+def is_valid_existing_output(path):
+	"""Return True if path is a TIFF GDAL can open with a valid raster."""
+	if not path.exists() or path.stat().st_size == 0:
+		return False
+	try:
+		dataset = gdal.Open(str(path))
+	except Exception:
+		return False
+	if dataset is None:
+		return False
+	valid = dataset.RasterXSize > 0 and dataset.RasterYSize > 0
+	dataset = None
+	return valid
+
+
+def iter_source_tifs():
+	"""Yield (client, job number, type, source TIFF, job output directory)."""
+	for client_code, client_folder in CLIENT_FOLDERS.items():
+		client_root = BASE_DIR / client_folder / SOURCE_SUBDIRECTORY
+		if not client_root.is_dir():
+			print(f"Source directory not found, skipping: {client_root}")
+			continue
+
+		for job_dir in sorted(client_root.iterdir()):
+			if not job_dir.is_dir():
+				continue
+			ortho_dir = job_dir / SOURCE_ORTHO_FOLDER
+			if not ortho_dir.is_dir():
+				continue
+			tif_paths = sorted(ortho_dir.glob("*.tif")) + sorted(
+				ortho_dir.glob("*.tiff")
+			)
+			for tif_path in tif_paths:
+				yield client_code, job_dir.name, "Mosaic", tif_path, job_dir
+
+
+def expected_tif_name(tif_path):
+	"""Return a canonical Mosaic name, falling back to the file's modified date."""
+
+	def modified_date_fallback():
+		try:
+			modified = datetime.fromtimestamp(tif_path.stat().st_mtime)
+		except OSError:
+			return None
+		# Keep the original stem as a suffix to distinguish files with no date.
+		return f"{modified:%d-%m-%Y}-Mosaic-{tif_path.stem}{tif_path.suffix}"
+
+	stem = tif_path.stem
+	canonical_match = CANONICAL_NAME_PATTERN.fullmatch(stem)
+	if canonical_match:
+		day = canonical_match.group("day")
+		month = canonical_match.group("month")
+		year = canonical_match.group("year")
+		suffix = canonical_match.group("suffix")
+	else:
+		date_match = next(
+			(
+				match
+				for pattern in DATE_NAME_PATTERNS
+				if (match := pattern.search(stem)) is not None
+			),
+			None,
+		)
+		if date_match is None:
+			return modified_date_fallback()
+		month = MONTHS.get(date_match.group("month").lower())
+		if month is None:
+			return modified_date_fallback()
+		day = date_match.group("day").zfill(2)
+		year = date_match.group("year")
+		suffix = date_match.group("suffix") or ""
+		if date_match.group("embedded_type"):
+			suffix = re.sub(r"^[- _]+", "", suffix)
+			suffix = f"-{suffix}" if suffix else ""
+
+	try:
+		date(int(year), int(month), int(day))
+	except ValueError:
+		return modified_date_fallback()
+
+	return f"{day}-{month}-{year}-Mosaic{suffix}{tif_path.suffix}"
+
+
+def preview_or_apply_renames():
+	"""Preview or apply canonical Mosaic filenames in each source folder."""
+	rows = []
+	rename_plans = []
+	planned_targets = {}
+
+	for client_code, job_number, type_tag, tif_path, _ in iter_source_tifs():
+		expected_name = expected_tif_name(tif_path)
+		if expected_name is None:
+			rows.append({
+				"client": client_code,
+				"job_number": job_number,
+				"type": type_tag,
+				"input_path": str(tif_path),
+				"output_path": "",
+				"status": "invalid_name",
+				"message": "Could not find a valid filename date or read the file modified date",
+			})
+			continue
+
+		target_path = tif_path.with_name(expected_name)
+		if target_path == tif_path:
+			rows.append({
+				"client": client_code,
+				"job_number": job_number,
+				"type": type_tag,
+				"input_path": str(tif_path),
+				"output_path": str(target_path),
+				"status": "already_correct",
+				"message": "",
+			})
+			continue
+
+		target_key = str(target_path).casefold()
+		if target_path.exists():
+			collision_message = "Target filename already exists"
+		elif target_key in planned_targets:
+			collision_message = f"Target duplicates {planned_targets[target_key]}"
+		else:
+			collision_message = ""
+
+		if collision_message:
+			rows.append({
+				"client": client_code,
+				"job_number": job_number,
+				"type": type_tag,
+				"input_path": str(tif_path),
+				"output_path": str(target_path),
+				"status": "collision",
+				"message": collision_message,
+			})
+			continue
+
+		planned_targets[target_key] = str(tif_path)
+		rename_plans.append((tif_path, target_path))
+		rows.append({
+			"client": client_code,
+			"job_number": job_number,
+			"type": type_tag,
+			"input_path": str(tif_path),
+			"output_path": str(target_path),
+			"status": "preview_rename" if DRY_RUN else "renamed",
+			"message": "",
+		})
+
+	if not DRY_RUN:
+		for source_path, target_path in rename_plans:
+			source_path.rename(target_path)
+
+	with RENAME_REPORT_CSV.open("w", newline="", encoding="utf-8-sig") as report_handle:
+		writer = csv.DictWriter(
+			report_handle,
+			fieldnames=["client", "job_number", "type", "input_path", "output_path", "status", "message"],
+		)
+		writer.writeheader()
+		writer.writerows(rows)
+
+	print(f"Rename report written: {RENAME_REPORT_CSV}")
+	print(f"Rename preview: {sum(row['status'] == 'preview_rename' for row in rows)} files")
+	print(f"Already correct: {sum(row['status'] == 'already_correct' for row in rows)} files")
+	print(f"Collisions: {sum(row['status'] == 'collision' for row in rows)} files")
+	print(f"Invalid names: {sum(row['status'] == 'invalid_name' for row in rows)} files")
+
+
+def main():
+	preview_or_apply_renames()
+	if DRY_RUN:
+		print("DRY_RUN is enabled; stopping after rename preview.")
+		return
+
+	processed = 0
+	skipped = 0
+	already_done = 0
+
+	with REPORT_CSV.open("w", newline="", encoding="utf-8-sig") as report_handle:
+		writer = csv.DictWriter(
+			report_handle,
+			fieldnames=["client", "job_number", "type", "input_path", "output_file_path", "status"],
+		)
+		writer.writeheader()
+
+		for client_code, job_number, type_tag, src_tif, output_dir in iter_source_tifs():
+			output_path = output_dir / src_tif.name
+			if is_valid_existing_output(output_path):
+				print(f"Already reprojected, skipping: {output_path}\n")
+				already_done += 1
+				status = "skipped_already_exists"
+			else:
+				if output_path.exists():
+					output_path.unlink()  # remove only an invalid/partial generated output
+				try:
+					if create_cog_from_tif(src_tif, output_path, TARGET_CRS_CODE):
+						print(f"Done: {output_path}\n")
+						processed += 1
+						status = "completed"
+					else:
+						skipped += 1
+						status = "skipped"
+				except Exception as error:
+					print(f"Error processing {src_tif}: {error}\n")
+					skipped += 1
+					status = "skipped"
+
+			writer.writerow({
+				"client": client_code,
+				"job_number": job_number,
+				"type": type_tag,
+				"input_path": str(src_tif),
+				"output_file_path": str(output_path),
+				"status": status,
+			})
+			report_handle.flush()
+
+	print(f"Report written: {REPORT_CSV}")
+	print(
+		f"\nFinished: {processed} COG files created, "
+		f"{already_done} already done, {skipped} skipped"
+	)
+
+
+if __name__ == "__main__":
+	main()

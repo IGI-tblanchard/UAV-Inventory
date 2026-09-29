@@ -1,6 +1,7 @@
 import csv
 import math
 import re
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -213,7 +214,16 @@ def iter_source_tifs():
 
 
 def expected_tif_name(tif_path, type_tag):
-    """Return the canonical name for a source TIFF, or None if its date is invalid."""
+    """Return the canonical name, falling back to the file's modified date."""
+
+    def modified_date_fallback():
+        try:
+            modified = datetime.fromtimestamp(tif_path.stat().st_mtime)
+        except OSError:
+            return None
+        # Keep the original stem as a suffix to distinguish files with no date.
+        return f"{modified:%d-%m-%Y}-{type_tag}-{tif_path.stem}{tif_path.suffix}"
+
     stem = tif_path.stem
     canonical_match = CANONICAL_NAME_PATTERN.fullmatch(stem)
     if canonical_match:
@@ -224,10 +234,10 @@ def expected_tif_name(tif_path, type_tag):
     else:
         date_match = next((pattern.search(stem) for pattern in DATE_NAME_PATTERNS if pattern.search(stem)), None)
         if not date_match:
-            return None
+            return modified_date_fallback()
         month = MONTHS.get(date_match.group("month").lower())
         if month is None:
-            return None
+            return modified_date_fallback()
         day = date_match.group("day").zfill(2)
         year = date_match.group("year")
         suffix = date_match.group("suffix") or ""
@@ -236,12 +246,9 @@ def expected_tif_name(tif_path, type_tag):
             suffix = f"-{suffix}" if suffix else ""
 
     try:
-        day_number = int(day)
-        month_number = int(month)
-        if not 1 <= day_number <= 31 or not 1 <= month_number <= 12:
-            return None
+        date(int(year), int(month), int(day))
     except ValueError:
-        return None
+        return modified_date_fallback()
 
     return f"{day}-{month}-{year}-{type_tag}{suffix}{tif_path.suffix}"
 
@@ -262,7 +269,7 @@ def preview_or_apply_renames():
                 "input_path": str(tif_path),
                 "output_path": "",
                 "status": "invalid_name",
-                "message": "Could not find a valid date in the filename",
+                "message": "Could not find a valid filename date or read the file modified date",
             })
             continue
 
