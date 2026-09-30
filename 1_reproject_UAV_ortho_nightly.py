@@ -54,12 +54,23 @@ CANONICAL_NAME_PATTERN = re.compile(
 )
 
 TARGET_CRS_CODE = "EPSG:2955"  # NAD83(CSRS) UTM Zone 11N
-RESAMPLING = gdal.GRA_Bilinear
 
 gdal.UseExceptions()
 gdal.SetConfigOption("GDAL_PAM_ENABLED", "NO")
 gdal.SetConfigOption("GDAL_CACHEMAX", "1024")
 gdal.SetConfigOption("GDAL_NUM_THREADS", "ALL_CPUS")
+
+
+def resampling_for_source(src_ds):
+	"""Choose nearest for palette indices; use bilinear for continuous imagery."""
+	palette_bands = [
+		band_index
+		for band_index in range(1, src_ds.RasterCount + 1)
+		if src_ds.GetRasterBand(band_index).GetColorTable() is not None
+	]
+	if palette_bands:
+		return gdal.GRA_NearestNeighbour, "NEAREST", f"palette-index band(s) {palette_bands}"
+	return gdal.GRA_Bilinear, "BILINEAR", "non-paletted imagery"
 
 
 def create_cog_from_tif(src_tif_path, output_path, target_crs_code):
@@ -77,13 +88,15 @@ def create_cog_from_tif(src_tif_path, output_path, target_crs_code):
 			or "UNKNOWN"
 		)
 		src_nodata = src_ds.GetRasterBand(1).GetNoDataValue()
+		resampling, overview_resampling, resampling_reason = resampling_for_source(src_ds)
 		print(f"REPROJECT: {src_tif_path}")
 		print(f"Input CRS: {src_crs_name} -- Output CRS: {target_crs_code}")
+		print(f"Resampling: {overview_resampling} ({resampling_reason})")
 
 		dst_crs = osr.SpatialReference()
 		dst_crs.ImportFromEPSG(int(target_crs_code.split(":")[1]))
 		vrt_ds = gdal.AutoCreateWarpedVRT(
-			src_ds, None, dst_crs.ExportToWkt(), RESAMPLING
+			src_ds, None, dst_crs.ExportToWkt(), resampling
 		)
 		if vrt_ds is None:
 			print(f"ERROR: Could not compute output dimensions for: {src_tif_path}")
@@ -103,7 +116,7 @@ def create_cog_from_tif(src_tif_path, output_path, target_crs_code):
 		warp_kwargs = {
 			"format": "COG",
 			"dstSRS": target_crs_code,
-			"resampleAlg": RESAMPLING,
+			"resampleAlg": resampling,
 			"xRes": x_res,
 			"yRes": y_res,
 			"creationOptions": [
@@ -111,7 +124,7 @@ def create_cog_from_tif(src_tif_path, output_path, target_crs_code):
 				"PREDICTOR=2",
 				"BLOCKSIZE=512",
 				f"OVERVIEW_COUNT={overview_count}",
-				"OVERVIEW_RESAMPLING=BILINEAR",
+				f"OVERVIEW_RESAMPLING={overview_resampling}",
 				"NUM_THREADS=ALL_CPUS",
 				"BIGTIFF=IF_SAFER",
 				"STATISTICS=YES",
@@ -223,6 +236,34 @@ def expected_tif_name(tif_path):
 	return f"{day}-{month}-{year}-Mosaic{suffix}{tif_path.suffix}"
 
 
+def sidecar_rename_pairs(tif_path, target_path):
+	"""Return adjacent files sharing the TIFF name stem and their renamed paths."""
+	pairs = []
+	tif_prefix = f"{tif_path.name}.".casefold()
+	stem_prefix = f"{tif_path.stem}.".casefold()
+
+	for candidate in sorted(tif_path.parent.iterdir()):
+		if not candidate.is_file():
+			continue
+
+		candidate_name = candidate.name
+		folded_name = candidate_name.casefold()
+		if folded_name.startswith(tif_prefix):
+			suffix = candidate_name[len(tif_path.name):]
+			new_name = f"{target_path.name}{suffix}"
+		elif folded_name.startswith(stem_prefix):
+			if candidate.suffix.casefold() in {".tif", ".tiff"}:
+				continue
+			suffix = candidate_name[len(tif_path.stem):]
+			new_name = f"{target_path.stem}{suffix}"
+		else:
+			continue
+
+		pairs.append((candidate, candidate.with_name(new_name)))
+
+	return pairs
+
+
 def preview_or_apply_renames():
 	"""Preview or apply canonical Mosaic filenames in each source folder."""
 	rows = []
@@ -256,13 +297,17 @@ def preview_or_apply_renames():
 			})
 			continue
 
-		target_key = str(target_path).casefold()
-		if target_path.exists():
-			collision_message = "Target filename already exists"
-		elif target_key in planned_targets:
-			collision_message = f"Target duplicates {planned_targets[target_key]}"
-		else:
-			collision_message = ""
+		sidecar_pairs = sidecar_rename_pairs(tif_path, target_path)
+		file_pairs = [(tif_path, target_path), *sidecar_pairs]
+		collision_message = ""
+		for _, planned_path in file_pairs:
+			target_key = str(planned_path).casefold()
+			if planned_path.exists():
+				collision_message = f"Target already exists: {planned_path}"
+				break
+			if target_key in planned_targets:
+				collision_message = f"Target duplicates {planned_targets[target_key]}"
+				break
 
 		if collision_message:
 			rows.append({
@@ -276,8 +321,9 @@ def preview_or_apply_renames():
 			})
 			continue
 
-		planned_targets[target_key] = str(tif_path)
-		rename_plans.append((tif_path, target_path))
+		for source_path, planned_path in file_pairs:
+			planned_targets[str(planned_path).casefold()] = str(source_path)
+		rename_plans.append((tif_path, target_path, sidecar_pairs))
 		rows.append({
 			"client": client_code,
 			"job_number": job_number,
@@ -289,7 +335,9 @@ def preview_or_apply_renames():
 		})
 
 	if not DRY_RUN:
-		for source_path, target_path in rename_plans:
+		for source_path, target_path, sidecar_pairs in rename_plans:
+			for sidecar_source, sidecar_target in sidecar_pairs:
+				sidecar_source.rename(sidecar_target)
 			source_path.rename(target_path)
 
 	with RENAME_REPORT_CSV.open("w", newline="", encoding="utf-8-sig") as report_handle:
@@ -305,6 +353,8 @@ def preview_or_apply_renames():
 	print(f"Already correct: {sum(row['status'] == 'already_correct' for row in rows)} files")
 	print(f"Collisions: {sum(row['status'] == 'collision' for row in rows)} files")
 	print(f"Invalid names: {sum(row['status'] == 'invalid_name' for row in rows)} files")
+	sidecar_label = "Sidecars renamed" if not DRY_RUN else "Sidecars to rename"
+	print(f"{sidecar_label}: {sum(len(plan[2]) for plan in rename_plans)} files")
 
 
 def main():

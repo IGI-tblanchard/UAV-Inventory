@@ -253,6 +253,34 @@ def expected_tif_name(tif_path, type_tag):
     return f"{day}-{month}-{year}-{type_tag}{suffix}{tif_path.suffix}"
 
 
+def sidecar_rename_pairs(tif_path, target_path):
+    """Return adjacent files sharing the TIFF name stem and their renamed paths."""
+    pairs = []
+    tif_prefix = f"{tif_path.name}.".casefold()
+    stem_prefix = f"{tif_path.stem}.".casefold()
+
+    for candidate in sorted(tif_path.parent.iterdir()):
+        if not candidate.is_file():
+            continue
+
+        candidate_name = candidate.name
+        folded_name = candidate_name.casefold()
+        if folded_name.startswith(tif_prefix):
+            suffix = candidate_name[len(tif_path.name):]
+            new_name = f"{target_path.name}{suffix}"
+        elif folded_name.startswith(stem_prefix):
+            if candidate.suffix.casefold() in {".tif", ".tiff"}:
+                continue
+            suffix = candidate_name[len(tif_path.stem):]
+            new_name = f"{target_path.stem}{suffix}"
+        else:
+            continue
+
+        pairs.append((candidate, candidate.with_name(new_name)))
+
+    return pairs
+
+
 def preview_or_apply_renames():
     """Preview or apply canonical DSM/DTM source names before reprojection."""
     rows = []
@@ -286,12 +314,17 @@ def preview_or_apply_renames():
             })
             continue
 
+        sidecar_pairs = sidecar_rename_pairs(tif_path, target_path)
+        file_pairs = [(tif_path, target_path), *sidecar_pairs]
         collision_message = ""
-        target_key = str(target_path).casefold()
-        if target_path.exists():
-            collision_message = "Target filename already exists"
-        elif target_key in planned_targets:
-            collision_message = f"Target duplicates {planned_targets[target_key]}"
+        for _, planned_path in file_pairs:
+            target_key = str(planned_path).casefold()
+            if planned_path.exists():
+                collision_message = f"Target already exists: {planned_path}"
+                break
+            if target_key in planned_targets:
+                collision_message = f"Target duplicates {planned_targets[target_key]}"
+                break
 
         if collision_message:
             rows.append({
@@ -305,8 +338,9 @@ def preview_or_apply_renames():
             })
             continue
 
-        planned_targets[target_key] = str(tif_path)
-        rename_plans.append((tif_path, target_path))
+        for source_path, planned_path in file_pairs:
+            planned_targets[str(planned_path).casefold()] = str(source_path)
+        rename_plans.append((tif_path, target_path, sidecar_pairs))
         rows.append({
             "client": client_code,
             "project": project,
@@ -318,7 +352,9 @@ def preview_or_apply_renames():
         })
 
     if not DRY_RUN:
-        for source_path, target_path in rename_plans:
+        for source_path, target_path, sidecar_pairs in rename_plans:
+            for sidecar_source, sidecar_target in sidecar_pairs:
+                sidecar_source.rename(sidecar_target)
             source_path.rename(target_path)
 
     with open(RENAME_REPORT_CSV, "w", newline="") as report_handle:
@@ -334,6 +370,8 @@ def preview_or_apply_renames():
     print(f"Already correct: {sum(row['status'] == 'already_correct' for row in rows)} files")
     print(f"Collisions: {sum(row['status'] == 'collision' for row in rows)} files")
     print(f"Invalid names: {sum(row['status'] == 'invalid_name' for row in rows)} files")
+    sidecar_label = "Sidecars renamed" if not DRY_RUN else "Sidecars to rename"
+    print(f"{sidecar_label}: {sum(len(plan[2]) for plan in rename_plans)} files")
 
 
 def main():

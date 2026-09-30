@@ -14,10 +14,10 @@ CLIENT_FOLDERS = {
     "TOU": "Tourmaline",
     "WCP": "Whitecap",
 }
-# base_subdir -> (type_tag, mosaic_dataset_name)
+# base_subdir -> type_tag
 TYPE_MAP = {
-    "FullFeature": ("DSM", "UAV_DSM"),
-    "BareEarth": ("DTM", "UAV_DTM"),
+    "FullFeature": "DSM",
+    "BareEarth": "DTM",
 }
 REPORT_CSV = Path(r"c:\Users\tblanchard\Documents\Tracy\Code\UAV Updates\5_mosaic_add_report.csv")
 
@@ -42,72 +42,186 @@ def staging_mosaic_name(client_folder, type_tag):
     return f"{client_folder}_{type_tag}"
 
 
-def gdb_path_for(client_folder):
-    return STAGING_GDB
-
-
 def iter_output_tifs():
     """Yield (client_code, client_folder, project, type_tag, mosaic_name, tif_path)
     for each reprojected DSM/DTM tif sitting directly in a project-id folder
     (step 4 reprojects in place and leaves the file in the project folder,
     not in a DSM/DTM subfolder)."""
     for client_code, client_folder in CLIENT_FOLDERS.items():
-        for base_subdir, (type_tag, _) in TYPE_MAP.items():
+        for base_subdir, type_tag in TYPE_MAP.items():
             type_root = BASE_DIR / client_folder / "LiDAR" / "UAV" / base_subdir
             if not type_root.is_dir():
                 continue
             for project_dir in sorted(type_root.iterdir()):
                 if not project_dir.is_dir():
                     continue
-                tif_paths = sorted(project_dir.glob("*.tif")) + sorted(project_dir.glob("*.tiff"))
+                tif_paths = sorted(
+                    path
+                    for pattern in ("*.tif", "*.tiff")
+                    for path in project_dir.glob(pattern)
+                    if path.is_file() and "-mosaic" in path.stem.casefold()
+                )
                 for tif_path in tif_paths:
                     mosaic_name = staging_mosaic_name(client_folder, type_tag)
                     yield client_code, client_folder, project_dir.name, type_tag, mosaic_name, tif_path
 
 
-def add_tifs_to_mosaic(mosaic_dataset_path, tif_rows, writer, report_handle, stop_on_error=False):
-    """Add each tif to the mosaic dataset. tif_rows is a list of
-    (client_code, project, type_tag, tif_path)."""
+def normalize_raster_path(path):
+    return str(path).replace("/", "\\").casefold()
+
+
+def mosaic_item_paths(mosaic_dataset_path):
+    """Export and read each mosaic item's actual source raster path by OID."""
+    mosaic_path = Path(mosaic_dataset_path)
+    catalog_path = mosaic_path.parent / f"AMD_{mosaic_path.name}_CAT"
+    if not arcpy.Exists(str(catalog_path)):
+        raise FileNotFoundError(f"Mosaic footprint catalog not found: {catalog_path}")
+
+    output_table = arcpy.CreateUniqueName(f"uav_paths_{mosaic_path.name}", str(mosaic_path.parent))
+    try:
+        arcpy.management.ExportMosaicDatasetPaths(
+            in_mosaic_dataset=mosaic_dataset_path,
+            output_table=output_table,
+            export_mode="ALL",
+            types_of_paths="RASTER",
+        )
+        output_fields = {field.name.casefold(): field.name for field in arcpy.ListFields(output_table)}
+        source_oid_field = output_fields.get("sourceoid")
+        path_field = output_fields.get("path")
+        if not source_oid_field or not path_field:
+            raise RuntimeError(f"Exported mosaic path table is missing SourceOID/Path fields: {output_table}")
+
+        item_paths = {}
+        with arcpy.da.SearchCursor(output_table, [source_oid_field, path_field]) as cursor:
+            for source_oid, source_path in cursor:
+                if source_path:
+                    item_paths.setdefault(source_oid, str(source_path))
+        return item_paths
+    finally:
+        if arcpy.Exists(output_table):
+            arcpy.management.Delete(output_table)
+
+
+def add_tifs_to_mosaic(mosaic_dataset_path, tif_rows, writer, report_handle):
+    """Skip catalog paths and add each remaining TIFF independently."""
     added_count = 0
     failed_count = 0
-
-    for client_code, project, type_tag, tif_path in tif_rows:
-        status = "added"
-        message = ""
-        try:
-            arcpy.management.AddRastersToMosaicDataset(
-                in_mosaic_dataset=mosaic_dataset_path,
-                raster_type="Raster Dataset",
-                input_path=str(tif_path),
-                update_cellsize_ranges="NO_CELL_SIZES",
-                update_boundary="NO_BOUNDARY",
-                update_overviews="NO_OVERVIEWS",
-                duplicate_items_action="EXCLUDE_DUPLICATES",
-                calculate_statistics="NO_STATISTICS",
-                build_pyramids="NO_PYRAMIDS",
-            )
-            added_count += 1
-        except Exception as add_err:
-            failed_count += 1
-            status = "failed"
-            message = str(add_err)
-            log(f"FAILED: {tif_path}")
-            log(message)
-            if stop_on_error:
-                raise RuntimeError(f"Production mosaic update stopped for {mosaic_dataset_path}: {add_err}") from add_err
-
-        writer.writerow({
-            "client": client_code,
-            "project": project,
-            "type": type_tag,
-            "tif_path": str(tif_path),
-            "mosaic_dataset": mosaic_dataset_path,
-            "status": status,
-            "message": message,
-        })
+    try:
+        item_paths = mosaic_item_paths(mosaic_dataset_path)
+    except Exception as path_err:
+        message = f"Could not read existing mosaic source paths: {path_err}"
+        log(f"Cannot safely check {mosaic_dataset_path}; skipping its TIFFs")
+        for client_code, project, type_tag, tif_path in tif_rows:
+            writer.writerow({
+                "client": client_code,
+                "project": project,
+                "type": type_tag,
+                "tif_path": str(tif_path),
+                "mosaic_dataset": mosaic_dataset_path,
+                "status": "check_failed",
+                "message": message,
+            })
         report_handle.flush()
+        return added_count, len(tif_rows)
 
-    log(f"Per-file add completed for {mosaic_dataset_path}. Added: {added_count}, Failed: {failed_count}")
+    existing_paths = {normalize_raster_path(path) for path in item_paths.values()}
+    pending_rows = []
+    successful_rows = []
+
+    for row in tif_rows:
+        client_code, project, type_tag, tif_path = row
+        if normalize_raster_path(tif_path) in existing_paths:
+            writer.writerow({
+                "client": client_code,
+                "project": project,
+                "type": type_tag,
+                "tif_path": str(tif_path),
+                "mosaic_dataset": mosaic_dataset_path,
+                "status": "already_present",
+                "message": "Source path already exists in mosaic catalog",
+            })
+        else:
+            pending_rows.append(row)
+    report_handle.flush()
+
+    if pending_rows:
+        log(f"Adding {len(pending_rows)} new TIFF(s) individually to {mosaic_dataset_path}")
+        for client_code, project, type_tag, tif_path in pending_rows:
+            try:
+                arcpy.management.AddRastersToMosaicDataset(
+                    in_mosaic_dataset=mosaic_dataset_path,
+                    raster_type="Raster Dataset",
+                    input_path=str(tif_path),
+                    update_cellsize_ranges="NO_CELL_SIZES",
+                    update_boundary="NO_BOUNDARY",
+                    update_overviews="NO_OVERVIEWS",
+                    duplicate_items_action="EXCLUDE_DUPLICATES",
+                    calculate_statistics="NO_STATISTICS",
+                    build_pyramids="NO_PYRAMIDS",
+                )
+            except Exception as add_err:
+                failed_count += 1
+                error_message = arcpy.GetMessages(2) or str(add_err)
+                log(f"FAILED: {tif_path}")
+                log(error_message)
+                writer.writerow({
+                    "client": client_code,
+                    "project": project,
+                    "type": type_tag,
+                    "tif_path": str(tif_path),
+                    "mosaic_dataset": mosaic_dataset_path,
+                    "status": "failed",
+                    "message": error_message,
+                })
+            else:
+                successful_rows.append((client_code, project, type_tag, tif_path))
+            report_handle.flush()
+
+        if successful_rows:
+            try:
+                item_paths = mosaic_item_paths(mosaic_dataset_path)
+            except Exception as verify_err:
+                item_paths = None
+                log(f"Could not verify added TIFFs in {mosaic_dataset_path}: {verify_err}")
+
+            verified_paths = (
+                {normalize_raster_path(path) for path in item_paths.values()}
+                if item_paths is not None
+                else set()
+            )
+            for client_code, project, type_tag, tif_path in successful_rows:
+                if item_paths is None:
+                    status = "verification_failed"
+                    message = f"Add tool succeeded, but catalog verification failed: {verify_err}"
+                    failed_count += 1
+                elif normalize_raster_path(tif_path) in verified_paths:
+                    status = "added"
+                    message = ""
+                    added_count += 1
+                else:
+                    status = "verification_failed"
+                    message = "Add tool succeeded, but source path is absent from the mosaic catalog"
+                    failed_count += 1
+                writer.writerow({
+                    "client": client_code,
+                    "project": project,
+                    "type": type_tag,
+                    "tif_path": str(tif_path),
+                    "mosaic_dataset": mosaic_dataset_path,
+                    "status": status,
+                    "message": message,
+                })
+            report_handle.flush()
+    else:
+        log(f"No new TIFFs to add to {mosaic_dataset_path}")
+
+    if item_paths is not None:
+        update_footprint_attributes(mosaic_dataset_path, item_paths)
+    else:
+        log(f"Skipped ProductName/GroupName update because mosaic paths could not be read: {mosaic_dataset_path}")
+
+    report_handle.flush()
+    log(f"Add completed for {mosaic_dataset_path}. Added: {added_count}, Failed: {failed_count}, Already present: {len(tif_rows) - len(pending_rows)}")
 
     try:
         result = arcpy.management.GetCount(mosaic_dataset_path)
@@ -119,8 +233,8 @@ def add_tifs_to_mosaic(mosaic_dataset_path, tif_rows, writer, report_handle, sto
     return added_count, failed_count
 
 
-def update_footprint_attributes(mosaic_dataset_path, tif_rows):
-    """Update ProductName and GroupName for TIFFs in the mosaic catalog."""
+def update_footprint_attributes(mosaic_dataset_path, item_paths):
+    """Store each item's source path and parent folder in ProductName/GroupName."""
     mosaic_path = Path(mosaic_dataset_path)
     catalog_path = mosaic_path.parent / f"AMD_{mosaic_path.name}_CAT"
     if not arcpy.Exists(str(catalog_path)):
@@ -134,30 +248,21 @@ def update_footprint_attributes(mosaic_dataset_path, tif_rows):
         log(f"Footprint fields missing from {catalog_path}: {sorted(missing_fields)}")
         return 0
 
-    path_values = {
-        str(tif_path).replace("/", "\\").casefold(): (str(tif_path), str(tif_path.parent))
-        for _, _, _, tif_path in tif_rows
-    }
+    oid_field = arcpy.Describe(str(catalog_path)).OIDFieldName
     updated_count = 0
-    matched_paths = set()
-    with arcpy.da.UpdateCursor(str(catalog_path), ["ProductName", "GroupName"]) as cursor:
+    with arcpy.da.UpdateCursor(str(catalog_path), [oid_field, "ProductName", "GroupName"]) as cursor:
         for row in cursor:
-            product_name = row[0]
-            if not product_name:
+            source_path = item_paths.get(row[0])
+            if source_path is None:
                 continue
-            normalized_product = str(product_name).replace("/", "\\").casefold()
-            path_value = path_values.get(normalized_product)
-            if path_value is None:
+            path_value = (source_path, str(Path(source_path).parent))
+            if (row[1], row[2]) == path_value:
                 continue
-            row[0], row[1] = path_value
+            row[1], row[2] = path_value
             cursor.updateRow(row)
-            matched_paths.add(normalized_product)
             updated_count += 1
 
-    unmatched_count = len(set(path_values) - matched_paths)
     log(f"Footprint attributes updated: {updated_count} rows for {catalog_path}")
-    if unmatched_count:
-        log(f"Footprint rows not matched: {unmatched_count} for {catalog_path}")
     return updated_count
 
 
@@ -166,9 +271,10 @@ def build_production_overviews(mosaic_dataset_path):
     try:
         arcpy.management.BuildOverviews(
             in_mosaic_dataset=mosaic_dataset_path,
-            define_missing_overviews="DEFINE_MISSING_OVERVIEWS",
-            generate_missing_overviews="GENERATE_MISSING_OVERVIEWS",
-            regenerate_existing_overviews="REGENERATE_EXISTING_OVERVIEWS",
+            define_missing="DEFINE_MISSING_OVERVIEWS",
+            generate_overviews="GENERATE_OVERVIEWS",
+            generate_missing_images="GENERATE_MISSING_IMAGES",
+            regenerate_stale_images="REGENERATE_STALE_IMAGES",
         )
         log(f"Production overviews generated: {mosaic_dataset_path}")
     except Exception as overview_error:
@@ -192,6 +298,7 @@ def main():
 
     total_added = 0
     total_failed = 0
+    production_mosaics_to_overview = set()
 
     with open(REPORT_CSV, "w", newline="") as report_handle:
         writer = csv.DictWriter(
@@ -211,20 +318,13 @@ def main():
             arcpy.env.workspace = str(gdb_path)
 
             for client_folder in CLIENT_FOLDERS.values():
-                for type_tag, _ in TYPE_MAP.values():
+                for type_tag in TYPE_MAP.values():
                     mosaic_name = staging_mosaic_name(client_folder, type_tag)
                     if (client_folder, mosaic_name) not in MOSAIC_SCOPE:
                         continue
                     tif_rows = grouped.get((client_folder, mosaic_name))
                     if not tif_rows:
                         log(f"No tifs found for {client_folder} / {mosaic_name}, skipping")
-                        if target_name == "production":
-                            mosaic_dataset_path = str(gdb_path / mosaic_name)
-                            if not arcpy.Exists(mosaic_dataset_path):
-                                raise FileNotFoundError(
-                                    f"Production mosaic dataset not found: {mosaic_dataset_path}"
-                                )
-                            build_production_overviews(mosaic_dataset_path)
                         continue
 
                     mosaic_dataset_path = str(gdb_path / mosaic_name)
@@ -240,13 +340,15 @@ def main():
                         tif_rows,
                         writer,
                         report_handle,
-                        stop_on_error=target_name == "production",
                     )
-                    update_footprint_attributes(mosaic_dataset_path, tif_rows)
-                    if target_name == "production":
-                        build_production_overviews(mosaic_dataset_path)
+                    if target_name == "production" and added_count > 0:
+                        production_mosaics_to_overview.add(mosaic_dataset_path)
                     total_added += added_count
                     total_failed += failed_count
+
+            if target_name == "production":
+                for mosaic_dataset_path in sorted(production_mosaics_to_overview):
+                    build_production_overviews(mosaic_dataset_path)
 
     log(f"Report written: {REPORT_CSV}")
     elapsed_seconds = time.perf_counter() - start_time
