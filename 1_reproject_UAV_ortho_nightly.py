@@ -3,13 +3,23 @@
 import csv
 import math
 import re
+import sys
 from datetime import date, datetime
 from pathlib import Path
 
-from osgeo import gdal, osr
+from task_run_report import RunReport
+
+run_report = RunReport(__file__)
+print(f"Detailed diagnostics: {run_report.path}")
+try:
+	from osgeo import gdal, osr
+except Exception as error:
+	run_report.exception("import_dependencies", error)
+	run_report.close()
+	raise
 
 # ---- configuration ----
-BASE_DIR = Path(r"P:\IGG\Z_Drive")
+BASE_DIR = Path(r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive")
 CLIENT_FOLDERS = {
 	"CVE": "Cenovus",
 	"TOU": "Tourmaline",
@@ -17,8 +27,8 @@ CLIENT_FOLDERS = {
 }
 SOURCE_SUBDIRECTORY = "Imagery/UAV"
 SOURCE_ORTHO_FOLDER = "Orthomosaic"
-REPORT_CSV = Path(r"c:\Users\tblanchard\Documents\Tracy\Code\UAV Updates\4_reproject_ortho_report.csv")
-RENAME_REPORT_CSV = Path(r"c:\Users\tblanchard\Documents\Tracy\Code\UAV Updates\4_reproject_ortho_rename_report.csv")
+REPORT_CSV = Path(r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Staging\UAV_Reports\4_reproject_ortho_report.csv")
+RENAME_REPORT_CSV = Path(r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Staging\UAV_Reports\4_reproject_ortho_rename_report.csv")
 DRY_RUN = False
 
 MONTHS = {
@@ -55,10 +65,15 @@ CANONICAL_NAME_PATTERN = re.compile(
 
 TARGET_CRS_CODE = "EPSG:2955"  # NAD83(CSRS) UTM Zone 11N
 
-gdal.UseExceptions()
-gdal.SetConfigOption("GDAL_PAM_ENABLED", "NO")
-gdal.SetConfigOption("GDAL_CACHEMAX", "1024")
-gdal.SetConfigOption("GDAL_NUM_THREADS", "ALL_CPUS")
+try:
+	gdal.UseExceptions()
+	gdal.SetConfigOption("GDAL_PAM_ENABLED", "NO")
+	gdal.SetConfigOption("GDAL_CACHEMAX", "1024")
+	gdal.SetConfigOption("GDAL_NUM_THREADS", "ALL_CPUS")
+except Exception as error:
+	run_report.exception("configure_gdal", error)
+	run_report.close()
+	raise
 
 
 def resampling_for_source(src_ds):
@@ -79,6 +94,8 @@ def create_cog_from_tif(src_tif_path, output_path, target_crs_code):
 		src_ds = gdal.Open(str(src_tif_path))
 		if src_ds is None:
 			print(f"ERROR: Could not open raster dataset: {src_tif_path}")
+			run_report.record("open_source_raster", "failed", input_path=src_tif_path,
+						  output_path=output_path, message="GDAL could not open source raster")
 			return False
 
 		src_crs = osr.SpatialReference(wkt=src_ds.GetProjection())
@@ -89,6 +106,13 @@ def create_cog_from_tif(src_tif_path, output_path, target_crs_code):
 		)
 		src_nodata = src_ds.GetRasterBand(1).GetNoDataValue()
 		resampling, overview_resampling, resampling_reason = resampling_for_source(src_ds)
+		palette = any(src_ds.GetRasterBand(i).GetColorTable() is not None
+					  for i in range(1, src_ds.RasterCount + 1))
+		if palette:
+			run_report.record("inspect_source_raster", "info", input_path=src_tif_path,
+						  output_path=output_path,
+						  message="Palette-index raster detected; nearest-neighbor selected",
+						  details=f"bands={src_ds.RasterCount}; resampling={overview_resampling}")
 		print(f"REPROJECT: {src_tif_path}")
 		print(f"Input CRS: {src_crs_name} -- Output CRS: {target_crs_code}")
 		print(f"Resampling: {overview_resampling} ({resampling_reason})")
@@ -100,6 +124,8 @@ def create_cog_from_tif(src_tif_path, output_path, target_crs_code):
 		)
 		if vrt_ds is None:
 			print(f"ERROR: Could not compute output dimensions for: {src_tif_path}")
+			run_report.record("calculate_warp_dimensions", "failed", input_path=src_tif_path,
+						  output_path=output_path, message="GDAL AutoCreateWarpedVRT returned no dataset")
 			src_ds = None
 			return False
 
@@ -140,6 +166,8 @@ def create_cog_from_tif(src_tif_path, output_path, target_crs_code):
 		src_ds = None
 		if dst_ds is None:
 			print(f"ERROR: Failed to create COG: {output_path}")
+			run_report.record("warp_to_cog", "failed", input_path=src_tif_path,
+						  output_path=output_path, message="GDAL Warp returned no output dataset")
 			return False
 
 		for band_index in range(1, dst_ds.RasterCount + 1):
@@ -150,14 +178,15 @@ def create_cog_from_tif(src_tif_path, output_path, target_crs_code):
 
 	except Exception as error:
 		print(f"ERROR in create_cog_from_tif: {error}")
+		run_report.exception("create_cog", error, input_path=src_tif_path, output_path=output_path)
 		return False
 
 
 def is_valid_existing_output(path):
 	"""Return True if path is a TIFF GDAL can open with a valid raster."""
-	if not path.exists() or path.stat().st_size == 0:
-		return False
 	try:
+		if not path.exists() or path.stat().st_size == 0:
+			return False
 		dataset = gdal.Open(str(path))
 	except Exception:
 		return False
@@ -181,6 +210,9 @@ def iter_source_tifs():
 				continue
 			ortho_dir = job_dir / SOURCE_ORTHO_FOLDER
 			if not ortho_dir.is_dir():
+				run_report.record("discover_ortho_folder", "info", client=client_folder,
+							  project_or_job=job_dir.name, input_path=ortho_dir,
+							  message="No Orthomosaic source folder in this job; skipped")
 				continue
 			tif_paths = sorted(ortho_dir.glob("*.tif")) + sorted(
 				ortho_dir.glob("*.tiff")
@@ -336,9 +368,20 @@ def preview_or_apply_renames():
 
 	if not DRY_RUN:
 		for source_path, target_path, sidecar_pairs in rename_plans:
-			for sidecar_source, sidecar_target in sidecar_pairs:
-				sidecar_source.rename(sidecar_target)
-			source_path.rename(target_path)
+			try:
+				for sidecar_source, sidecar_target in sidecar_pairs:
+					sidecar_source.rename(sidecar_target)
+				source_path.rename(target_path)
+				run_report.record("rename_source_and_sidecars", "completed",
+							  input_path=source_path, output_path=target_path,
+							  message=f"Renamed {len(sidecar_pairs)} sidecar(s)")
+			except Exception as error:
+				row = next(row for row in rows if row["input_path"] == str(source_path))
+				row["status"] = "rename_failed"
+				row["message"] = f"{type(error).__name__}: {error}"
+				run_report.exception("rename_source_and_sidecars", error,
+								 input_path=source_path, output_path=target_path,
+								 details=f"Sidecars planned: {sidecar_pairs}")
 
 	with RENAME_REPORT_CSV.open("w", newline="", encoding="utf-8-sig") as report_handle:
 		writer = csv.DictWriter(
@@ -347,6 +390,17 @@ def preview_or_apply_renames():
 		)
 		writer.writeheader()
 		writer.writerows(rows)
+
+	rename_failures = [row for row in rows if row["status"] == "rename_failed"]
+	if rename_failures:
+		raise OSError(f"{len(rename_failures)} TIFF rename operation(s) failed; see {RENAME_REPORT_CSV}")
+
+	for row in rows:
+		if row["status"] in {"collision", "invalid_name"}:
+			run_report.record("rename_preflight", "warning", client=row["client"],
+						  project_or_job=row["job_number"], data_type=row["type"],
+						  input_path=row["input_path"], output_path=row["output_path"],
+						  message=row["message"] or row["status"])
 
 	print(f"Rename report written: {RENAME_REPORT_CSV}")
 	print(f"Rename preview: {sum(row['status'] == 'preview_rename' for row in rows)} files")
@@ -358,10 +412,13 @@ def preview_or_apply_renames():
 
 
 def main():
+	run_report.record("run", "started", message="Orthomosaic rename and reprojection run started",
+				  details=f"BASE_DIR={BASE_DIR}; DRY_RUN={DRY_RUN}; target_crs={TARGET_CRS_CODE}")
 	preview_or_apply_renames()
 	if DRY_RUN:
 		print("DRY_RUN is enabled; stopping after rename preview.")
-		return
+		run_report.record("run", "completed", message="Dry run completed; reprojection intentionally not run")
+		return 0
 
 	processed = 0
 	skipped = 0
@@ -380,21 +437,36 @@ def main():
 				print(f"Already reprojected, skipping: {output_path}\n")
 				already_done += 1
 				status = "skipped_already_exists"
+				run_report.record("reprojection", "skipped", client=client_code,
+							  project_or_job=job_number, data_type=type_tag,
+							  input_path=src_tif, output_path=output_path,
+							  message="Existing output opened successfully; reproject skipped")
 			else:
-				if output_path.exists():
-					output_path.unlink()  # remove only an invalid/partial generated output
 				try:
+					if output_path.exists():
+						output_path.unlink()  # remove only an invalid/partial generated output
 					if create_cog_from_tif(src_tif, output_path, TARGET_CRS_CODE):
 						print(f"Done: {output_path}\n")
 						processed += 1
 						status = "completed"
+						run_report.record("reprojection", "completed", client=client_code,
+									  project_or_job=job_number, data_type=type_tag,
+								  input_path=src_tif, output_path=output_path,
+								  message="COG created successfully")
 					else:
 						skipped += 1
 						status = "skipped"
+						run_report.record("reprojection", "failed", client=client_code,
+									  project_or_job=job_number, data_type=type_tag,
+								  input_path=src_tif, output_path=output_path,
+								  message="COG creation returned failure; inspect preceding diagnostic events")
 				except Exception as error:
 					print(f"Error processing {src_tif}: {error}\n")
 					skipped += 1
 					status = "skipped"
+					run_report.exception("reprojection", error, client=client_code,
+									 project_or_job=job_number, data_type=type_tag,
+									 input_path=src_tif, output_path=output_path)
 
 			writer.writerow({
 				"client": client_code,
@@ -411,7 +483,20 @@ def main():
 		f"\nFinished: {processed} COG files created, "
 		f"{already_done} already done, {skipped} skipped"
 	)
+	run_report.record("run", "completed" if skipped == 0 else "completed_with_issues",
+				  message=f"processed={processed}; already_done={already_done}; skipped={skipped}",
+				  output_path=REPORT_CSV)
+	return 1 if run_report.issue_count else 0
 
 
 if __name__ == "__main__":
-	main()
+	try:
+		exit_code = main()
+	except Exception as error:
+		run_report.exception("run_fatal", error)
+		print(f"Fatal run error. Diagnostics: {run_report.path}")
+		run_report.close()
+		sys.exit(1)
+	print(f"Detailed diagnostics: {run_report.path}")
+	run_report.close()
+	sys.exit(exit_code)
