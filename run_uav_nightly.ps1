@@ -4,6 +4,8 @@ $propy = 'C:\Program Files\ArcGIS\Pro\bin\Python\Scripts\propy.bat'
 $scriptRoot = 'C:\Users\tblanchard\Documents\Tracy\Code\UAV Updates\UAV-Inventory'
 $reportRoot = '\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Staging\UAV_Reports'
 $dataRoot = '\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive'
+$clientRoot = Join-Path $dataRoot 'Client'
+$geodatabaseRoot = Join-Path $dataRoot 'Geodatabase'
 $runStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $transcriptPath = Join-Path $reportRoot "uav_nightly_scheduler_$runStamp.log"
 $scripts = @(
@@ -30,6 +32,11 @@ try {
     }
     if (-not (Test-Path -LiteralPath $dataRoot -PathType Container)) {
         throw "UNC data share is unavailable to this scheduled task account: $dataRoot"
+    }
+    foreach ($requiredRoot in @($clientRoot, $geodatabaseRoot)) {
+        if (-not (Test-Path -LiteralPath $requiredRoot -PathType Container)) {
+            throw "Required migrated data folder is unavailable: $requiredRoot"
+        }
     }
     if (-not (Test-Path -LiteralPath $reportRoot -PathType Container)) {
         throw "UAV reports folder is unavailable to this scheduled task account: $reportRoot"

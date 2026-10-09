@@ -17,9 +17,9 @@ except Exception as error:
     raise
 
 # ---- configuration ----
-BASE_DIR = Path(r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive")
+BASE_DIR = Path(r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Client")
 STAGING_GDB = Path(r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Staging\UAV_Staging.gdb")
-PRODUCTION_GDB = Path(r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\UAV_Mosaics.gdb")
+PRODUCTION_GDB = Path(r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Geodatabase\UAV_Mosaics.gdb")
 CLIENT_FOLDERS = {
     "CVE": "Cenovus",
     "TOU": "Tourmaline",

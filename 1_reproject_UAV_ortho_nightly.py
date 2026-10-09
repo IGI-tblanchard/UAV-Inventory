@@ -19,7 +19,7 @@ except Exception as error:
 	raise
 
 # ---- configuration ----
-BASE_DIR = Path(r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive")
+BASE_DIR = Path(r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Client")
 CLIENT_FOLDERS = {
 	"CVE": "Cenovus",
 	"TOU": "Tourmaline",
