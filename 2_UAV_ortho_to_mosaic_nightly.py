@@ -205,10 +205,12 @@ def add_tifs_to_mosaic(mosaic_dataset_path, tif_rows, writer, report_handle):
 			report_handle.flush()
 
 		if successful_rows:
+			verify_error_message = ""
 			try:
 				item_paths = mosaic_item_paths(mosaic_dataset_path)
 			except Exception as verify_error:
 				item_paths = None
+				verify_error_message = str(verify_error)
 				log(f"Could not verify added TIFFs in {mosaic_dataset_path}: {verify_error}")
 				run_report.exception("verify_mosaic_additions", verify_error,
 								  output_path=mosaic_dataset_path)
@@ -221,7 +223,7 @@ def add_tifs_to_mosaic(mosaic_dataset_path, tif_rows, writer, report_handle):
 			for client_code, job_number, tif_path in successful_rows:
 				if item_paths is None:
 					status = "verification_failed"
-					message = f"Add tool succeeded, but catalog verification failed: {verify_error}"
+					message = f"Add tool succeeded, but catalog verification failed: {verify_error_message}"
 					failed_count += 1
 				elif normalize_raster_path(tif_path) in verified_paths:
 					status = "added"
@@ -251,12 +253,12 @@ def add_tifs_to_mosaic(mosaic_dataset_path, tif_rows, writer, report_handle):
 		try:
 			update_footprint_attributes(mosaic_dataset_path, item_paths)
 		except Exception as update_error:
-			log(f"Failed updating mosaic ProductName/GroupName fields: {update_error}")
+			log(f"Failed updating mosaic Path/FolderPath fields: {update_error}")
 			run_report.exception("update_catalog_attributes", update_error,
 						  output_path=mosaic_dataset_path, details=arcpy.GetMessages(2))
 			failed_count += 1
 	else:
-		log(f"Skipped ProductName/GroupName update because mosaic paths could not be read: {mosaic_dataset_path}")
+		log(f"Skipped Path/FolderPath update because mosaic paths could not be read: {mosaic_dataset_path}")
 
 	report_handle.flush()
 	log(
@@ -273,7 +275,7 @@ def add_tifs_to_mosaic(mosaic_dataset_path, tif_rows, writer, report_handle):
 
 
 def update_footprint_attributes(mosaic_dataset_path, item_paths):
-	"""Store each item's source path and parent folder in ProductName/GroupName."""
+	"""Store each item's source path and parent folder in Path/FolderPath."""
 	mosaic_path = Path(mosaic_dataset_path)
 	catalog_path = mosaic_path.parent / f"AMD_{mosaic_path.name}_CAT"
 	if not arcpy.Exists(str(catalog_path)):
@@ -281,7 +283,7 @@ def update_footprint_attributes(mosaic_dataset_path, item_paths):
 		return 0
 
 	field_names = {field.name.upper() for field in arcpy.ListFields(str(catalog_path))}
-	required_fields = {"PRODUCTNAME", "GROUPNAME"}
+	required_fields = {"PATH", "FOLDERPATH"}
 	missing_fields = required_fields - field_names
 	if missing_fields:
 		log(f"Footprint fields missing from {catalog_path}: {sorted(missing_fields)}")
@@ -289,7 +291,7 @@ def update_footprint_attributes(mosaic_dataset_path, item_paths):
 
 	oid_field = arcpy.Describe(str(catalog_path)).OIDFieldName
 	updated_count = 0
-	with arcpy.da.UpdateCursor(str(catalog_path), [oid_field, "ProductName", "GroupName"]) as cursor:
+	with arcpy.da.UpdateCursor(str(catalog_path), [oid_field, "Path", "FolderPath"]) as cursor:
 		for row in cursor:
 			source_path = item_paths.get(row[0])
 			if source_path is None:
@@ -303,7 +305,7 @@ def update_footprint_attributes(mosaic_dataset_path, item_paths):
 
 	log(f"Footprint attributes updated: {updated_count} rows for {catalog_path}")
 	run_report.record("update_catalog_attributes", "completed", output_path=catalog_path,
-				  message=f"Updated {updated_count} ProductName/GroupName row(s)")
+					  message=f"Updated {updated_count} Path/FolderPath row(s)")
 	return updated_count
 
 
