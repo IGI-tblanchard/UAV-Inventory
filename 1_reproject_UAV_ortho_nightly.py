@@ -1,4 +1,4 @@
-"""Rename and reproject client UAV orthomosaics to Cloud Optimized GeoTIFFs."""
+"""Reproject client UAV orthomosaics to Cloud Optimized GeoTIFFs."""
 
 import csv
 import math
@@ -28,8 +28,6 @@ CLIENT_FOLDERS = {
 SOURCE_SUBDIRECTORY = "Imagery/UAV"
 SOURCE_ORTHO_FOLDER = "Orthomosaic"
 REPORT_CSV = Path(r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Staging\UAV_Reports\4_reproject_ortho_report.csv")
-RENAME_REPORT_CSV = Path(r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Staging\UAV_Reports\4_reproject_ortho_rename_report.csv")
-DRY_RUN = False
 
 MONTHS = {
 	"jan": "01",
@@ -47,19 +45,40 @@ MONTHS = {
 }
 
 DATE_NAME_PATTERNS = (
-	re.compile(
-		r"(?P<month>[A-Za-z]{3})[- ](?P<day>\d{1,2})[- ](?P<year>\d{4})"
-		r"(?:[- _]*(?P<embedded_type>Mosaic|Orthomosaic|Ortho))?(?P<suffix>(?:[- _]+.+)?)$",
-		re.IGNORECASE,
-	),
-	re.compile(
-		r"(?P<day>\d{1,2})[- ](?P<month>[A-Za-z]{3})[- ](?P<year>\d{4})"
-		r"(?:[- _]*(?P<embedded_type>Mosaic|Orthomosaic|Ortho))?(?P<suffix>(?:[- _]+.+)?)$",
-		re.IGNORECASE,
-	),
+	re.compile(r"(?<!\d)(?P<day>\d{1,2})[-_ ](?P<month>\d{1,2})[-_ ](?P<year>20\d{2})(?!\d)"),
+	re.compile(r"(?<!\d)(?P<year>20\d{2})[-_](?P<month>\d{1,2})[-_](?P<day>\d{1,2})(?!\d)"),
+	re.compile(r"(?<!\d)(?P<day>\d{1,2})[-_ ](?P<month_name>[A-Za-z]{3})[-_ ](?P<year>20\d{2})(?!\d)", re.IGNORECASE),
+	re.compile(r"(?<!\d)(?P<month_name>[A-Za-z]{3})[-_ ](?P<day>\d{1,2})[-_ ](?P<year>20\d{2})(?!\d)", re.IGNORECASE),
+	re.compile(r"(?<!\d)(?P<year>20\d{2})(?P<month>\d{2})(?P<day>\d{2})(?!\d)"),
 )
-CANONICAL_NAME_PATTERN = re.compile(
-	r"^(?P<day>\d{2})-(?P<month>\d{2})-(?P<year>\d{4})-Mosaic(?P<suffix>(?:-.+)?)$",
+PART_PATTERN = re.compile(r"(?<![A-Za-z])Part[\s_-]*(?P<number>\d+)(?!\d)", re.IGNORECASE)
+FLIGHT_PATTERN = re.compile(
+	r"(?<![A-Za-z])Flights?[\s_-]*(?P<numbers>\d+(?:\s*(?:-|and|&)\s*\d+)*)(?!\d)",
+	re.IGNORECASE,
+)
+NUMBERED_QUALIFIER_PATTERNS = (
+	("Option", re.compile(r"(?<![A-Za-z])Option[\s_-]*(?P<number>\d+)(?!\d)", re.IGNORECASE)),
+	("Borrow", re.compile(r"(?<![A-Za-z])Borrow[\s_-]*(?P<number>\d+)(?!\d)", re.IGNORECASE)),
+)
+FIXED_QUALIFIER_PATTERNS = (
+	("Thermal-Base", re.compile(r"(?<![A-Za-z])Thermal[\s_-]+Base(?![A-Za-z])", re.IGNORECASE)),
+	("No-GCPS", re.compile(r"(?<![A-Za-z])No[\s_-]*GCPs?(?![A-Za-z])", re.IGNORECASE)),
+	("Combined", re.compile(r"(?<![A-Za-z])Combined(?![A-Za-z])", re.IGNORECASE)),
+	("Lease", re.compile(r"(?<![A-Za-z])Lease(?![A-Za-z])", re.IGNORECASE)),
+	("Fixed", re.compile(r"(?<![A-Za-z])Fixed(?![A-Za-z])", re.IGNORECASE)),
+)
+REDUCED_PATTERN = re.compile(
+	r"(?<![A-Za-z])(?:reduc(?:e|ed|ted|d)?|rduced|redced|reduse|reduected)(?![A-Za-z])",
+	re.IGNORECASE,
+)
+RESOLUTION_PATTERN = re.compile(
+	r"(?<!\d)0[._-](?:05|1|10|2|20)m?(?![A-Za-z\d])|(?<!\d)(?:05|5|10|20)\s?cm(?![A-Za-z])",
+	re.IGNORECASE,
+)
+IGNORED_NAME_WORDS = re.compile(
+	r"(?<![A-Za-z])(?:transparent|mosaic|orthomosaic|ortho|lidar|rgb|group\d*|group|"
+	r"grid|spacing|decimation|decimated|photo|jpg|dom|rerun|result|updated|riser|"
+	r"shift|if|using)(?![A-Za-z])",
 	re.IGNORECASE,
 )
 
@@ -222,207 +241,113 @@ def iter_source_tifs():
 
 
 def expected_tif_name(tif_path):
-	"""Return a canonical Mosaic name, falling back to the file's modified date."""
+	"""Return a canonical output name and any naming review notes.
 
-	def modified_date_fallback():
-		try:
-			modified = datetime.fromtimestamp(tif_path.stat().st_mtime)
-		except OSError:
-			return None
-		# Keep the original stem as a suffix to distinguish files with no date.
-		return f"{modified:%d-%m-%Y}-Mosaic-{tif_path.stem}{tif_path.suffix}"
-
+	Source TIFFs are never renamed; this name is used only for the output COG.
+	"""
 	stem = tif_path.stem
-	canonical_match = CANONICAL_NAME_PATTERN.fullmatch(stem)
-	if canonical_match:
-		day = canonical_match.group("day")
-		month = canonical_match.group("month")
-		year = canonical_match.group("year")
-		suffix = canonical_match.group("suffix")
-	else:
-		date_match = next(
-			(
-				match
-				for pattern in DATE_NAME_PATTERNS
-				if (match := pattern.search(stem)) is not None
-			),
-			None,
-		)
-		if date_match is None:
-			return modified_date_fallback()
-		month = MONTHS.get(date_match.group("month").lower())
-		if month is None:
-			return modified_date_fallback()
-		day = date_match.group("day").zfill(2)
-		year = date_match.group("year")
-		suffix = date_match.group("suffix") or ""
-		if date_match.group("embedded_type"):
-			suffix = re.sub(r"^[- _]+", "", suffix)
-			suffix = f"-{suffix}" if suffix else ""
-
-	try:
-		date(int(year), int(month), int(day))
-	except ValueError:
-		return modified_date_fallback()
-
-	return f"{day}-{month}-{year}-Mosaic{suffix}{tif_path.suffix}"
-
-
-def sidecar_rename_pairs(tif_path, target_path):
-	"""Return adjacent files sharing the TIFF name stem and their renamed paths."""
-	pairs = []
-	tif_prefix = f"{tif_path.name}.".casefold()
-	stem_prefix = f"{tif_path.stem}.".casefold()
-
-	for candidate in sorted(tif_path.parent.iterdir()):
-		if not candidate.is_file():
-			continue
-
-		candidate_name = candidate.name
-		folded_name = candidate_name.casefold()
-		if folded_name.startswith(tif_prefix):
-			suffix = candidate_name[len(tif_path.name):]
-			new_name = f"{target_path.name}{suffix}"
-		elif folded_name.startswith(stem_prefix):
-			if candidate.suffix.casefold() in {".tif", ".tiff"}:
-				continue
-			suffix = candidate_name[len(tif_path.stem):]
-			new_name = f"{target_path.stem}{suffix}"
-		else:
-			continue
-
-		pairs.append((candidate, candidate.with_name(new_name)))
-
-	return pairs
-
-
-def preview_or_apply_renames():
-	"""Preview or apply canonical Mosaic filenames in each source folder."""
-	rows = []
-	rename_plans = []
-	planned_targets = {}
-
-	for client_code, job_number, type_tag, tif_path, _ in iter_source_tifs():
-		expected_name = expected_tif_name(tif_path)
-		if expected_name is None:
-			rows.append({
-				"client": client_code,
-				"job_number": job_number,
-				"type": type_tag,
-				"input_path": str(tif_path),
-				"output_path": "",
-				"status": "invalid_name",
-				"message": "Could not find a valid filename date or read the file modified date",
-			})
-			continue
-
-		target_path = tif_path.with_name(expected_name)
-		if target_path == tif_path:
-			rows.append({
-				"client": client_code,
-				"job_number": job_number,
-				"type": type_tag,
-				"input_path": str(tif_path),
-				"output_path": str(target_path),
-				"status": "already_correct",
-				"message": "",
-			})
-			continue
-
-		sidecar_pairs = sidecar_rename_pairs(tif_path, target_path)
-		file_pairs = [(tif_path, target_path), *sidecar_pairs]
-		collision_message = ""
-		for _, planned_path in file_pairs:
-			target_key = str(planned_path).casefold()
-			if planned_path.exists():
-				collision_message = f"Target already exists: {planned_path}"
-				break
-			if target_key in planned_targets:
-				collision_message = f"Target duplicates {planned_targets[target_key]}"
-				break
-
-		if collision_message:
-			rows.append({
-				"client": client_code,
-				"job_number": job_number,
-				"type": type_tag,
-				"input_path": str(tif_path),
-				"output_path": str(target_path),
-				"status": "collision",
-				"message": collision_message,
-			})
-			continue
-
-		for source_path, planned_path in file_pairs:
-			planned_targets[str(planned_path).casefold()] = str(source_path)
-		rename_plans.append((tif_path, target_path, sidecar_pairs))
-		rows.append({
-			"client": client_code,
-			"job_number": job_number,
-			"type": type_tag,
-			"input_path": str(tif_path),
-			"output_path": str(target_path),
-			"status": "preview_rename" if DRY_RUN else "renamed",
-			"message": "",
-		})
-
-	if not DRY_RUN:
-		for source_path, target_path, sidecar_pairs in rename_plans:
+	dates = []
+	for pattern in DATE_NAME_PATTERNS:
+		for match in pattern.finditer(stem):
+			groups = match.groupdict()
+			month_text = groups.get("month_name")
+			month = MONTHS.get(month_text.lower()) if month_text else groups.get("month")
 			try:
-				for sidecar_source, sidecar_target in sidecar_pairs:
-					sidecar_source.rename(sidecar_target)
-				source_path.rename(target_path)
-				run_report.record("rename_source_and_sidecars", "completed",
-							  input_path=source_path, output_path=target_path,
-							  message=f"Renamed {len(sidecar_pairs)} sidecar(s)")
-			except Exception as error:
-				row = next(row for row in rows if row["input_path"] == str(source_path))
-				row["status"] = "rename_failed"
-				row["message"] = f"{type(error).__name__}: {error}"
-				run_report.exception("rename_source_and_sidecars", error,
-								 input_path=source_path, output_path=target_path,
-								 details=f"Sidecars planned: {sidecar_pairs}")
+				parsed = date(int(groups["year"]), int(month), int(groups["day"]))
+			except (TypeError, ValueError):
+				continue
+			dates.append((match.start(), match.end(), parsed))
 
-	with RENAME_REPORT_CSV.open("w", newline="", encoding="utf-8-sig") as report_handle:
-		writer = csv.DictWriter(
-			report_handle,
-			fieldnames=["client", "job_number", "type", "input_path", "output_path", "status", "message"],
-		)
-		writer.writeheader()
-		writer.writerows(rows)
+	dates = sorted(set(dates), key=lambda item: item[0])
+	name_notes = []
+	if dates:
+		selected_date = dates[1][2] if len(dates) > 1 else dates[0][2]
+	else:
+		try:
+			selected_date = datetime.fromtimestamp(tif_path.stat().st_mtime).date()
+			name_notes.append("No date in source filename; filesystem modified date used")
+		except OSError:
+			return None, "No filename date or readable modified date"
 
-	rename_failures = [row for row in rows if row["status"] == "rename_failed"]
-	if rename_failures:
-		raise OSError(f"{len(rename_failures)} TIFF rename operation(s) failed; see {RENAME_REPORT_CSV}")
+	qualifiers = []
+	for match in PART_PATTERN.finditer(stem):
+		qualifiers.append((match.start(), f"Part{match.group('number')}"))
+	for match in FLIGHT_PATTERN.finditer(stem):
+		numbers = re.findall(r"\d+", match.group("numbers"))
+		if numbers:
+			qualifiers.append((match.start(), f"Flight{'-'.join(numbers)}"))
+	for label, pattern in NUMBERED_QUALIFIER_PATTERNS:
+		for match in pattern.finditer(stem):
+			qualifiers.append((match.start(), f"{label}{match.group('number')}"))
+	for label, pattern in FIXED_QUALIFIER_PATTERNS:
+		for match in pattern.finditer(stem):
+			qualifiers.append((match.start(), label))
 
-	for row in rows:
-		if row["status"] in {"collision", "invalid_name"}:
-			run_report.record("rename_preflight", "warning", client=row["client"],
-						  project_or_job=row["job_number"], data_type=row["type"],
-						  input_path=row["input_path"], output_path=row["output_path"],
-						  message=row["message"] or row["status"])
+	residual = stem
+	for pattern in DATE_NAME_PATTERNS:
+		residual = pattern.sub(" ", residual)
+	for pattern in (PART_PATTERN, FLIGHT_PATTERN):
+		residual = pattern.sub(" ", residual)
+	for _, pattern in NUMBERED_QUALIFIER_PATTERNS:
+		residual = pattern.sub(" ", residual)
+	for _, pattern in FIXED_QUALIFIER_PATTERNS:
+		residual = pattern.sub(" ", residual)
+	residual = REDUCED_PATTERN.sub(" ", residual)
+	residual = RESOLUTION_PATTERN.sub(" ", residual)
+	residual = IGNORED_NAME_WORDS.sub(" ", residual)
+	residual = re.sub(r"(?<!\d)\d{5}(?!\d)", " ", residual)
+	residual = re.sub(r"\b\d+(?:-\d+)*\b", " ", residual)
+	unknown_words = [
+		word for word in re.split(r"[^A-Za-z0-9]+", residual)
+		if len(word) > 1 and not word.isdigit()
+	]
+	if unknown_words:
+		unknown_clarifier = "-".join(unknown_words)
+		qualifiers.append((len(stem), unknown_clarifier))
+		name_notes.append(f"Unrecognized filename text retained as clarifier: {unknown_clarifier}")
 
-	print(f"Rename report written: {RENAME_REPORT_CSV}")
-	print(f"Rename preview: {sum(row['status'] == 'preview_rename' for row in rows)} files")
-	print(f"Already correct: {sum(row['status'] == 'already_correct' for row in rows)} files")
-	print(f"Collisions: {sum(row['status'] == 'collision' for row in rows)} files")
-	print(f"Invalid names: {sum(row['status'] == 'invalid_name' for row in rows)} files")
-	sidecar_label = "Sidecars renamed" if not DRY_RUN else "Sidecars to rename"
-	print(f"{sidecar_label}: {sum(len(plan[2]) for plan in rename_plans)} files")
+	parts = [selected_date.strftime("%d-%m-%Y"), "Mosaic"]
+	seen_qualifiers = set()
+	for _, qualifier in sorted(qualifiers, key=lambda item: item[0]):
+		key = qualifier.casefold()
+		if key not in seen_qualifiers:
+			parts.append(qualifier)
+			seen_qualifiers.add(key)
+
+	is_reduced = bool(REDUCED_PATTERN.search(stem) or RESOLUTION_PATTERN.search(stem))
+	if is_reduced:
+		parts.append("Reduced")
+
+	return f"{'-'.join(parts)}{tif_path.suffix}", "; ".join(name_notes)
 
 
 def main():
-	run_report.record("run", "started", message="Orthomosaic rename and reprojection run started",
-				  details=f"BASE_DIR={BASE_DIR}; DRY_RUN={DRY_RUN}; target_crs={TARGET_CRS_CODE}")
-	preview_or_apply_renames()
-	if DRY_RUN:
-		print("DRY_RUN is enabled; stopping after rename preview.")
-		run_report.record("run", "completed", message="Dry run completed; reprojection intentionally not run")
-		return 0
+	run_report.record("run", "started", message="Orthomosaic reprojection run started",
+				  details=f"BASE_DIR={BASE_DIR}; target_crs={TARGET_CRS_CODE}")
+	source_items = list(iter_source_tifs())
+	output_names = {}
+	target_owners = {}
+	name_collisions = set()
+	for item in source_items:
+		_, _, _, src_tif, output_dir = item
+		output_name, name_note = expected_tif_name(src_tif)
+		if output_name is None:
+			output_names[src_tif] = (None, name_note)
+			continue
+		output_path = output_dir / output_name
+		output_names[src_tif] = (output_path, name_note)
+		target_key = str(output_path).casefold()
+		if target_key in target_owners and target_owners[target_key] != src_tif:
+			name_collisions.add(target_owners[target_key])
+			name_collisions.add(src_tif)
+		else:
+			target_owners[target_key] = src_tif
 
 	processed = 0
 	skipped = 0
 	already_done = 0
+	collision_count = 0
+	naming_review_count = 0
 
 	with REPORT_CSV.open("w", newline="", encoding="utf-8-sig") as report_handle:
 		writer = csv.DictWriter(
@@ -431,9 +356,28 @@ def main():
 		)
 		writer.writeheader()
 
-		for client_code, job_number, type_tag, src_tif, output_dir in iter_source_tifs():
-			output_path = output_dir / src_tif.name
-			if is_valid_existing_output(output_path):
+		for client_code, job_number, type_tag, src_tif, output_dir in source_items:
+			output_path, name_note = output_names[src_tif]
+			if name_note:
+				naming_review_count += 1
+				print(f"NAME REVIEW: {src_tif}: {name_note}")
+				run_report.record("name_output_tif", "warning", client=client_code,
+							  project_or_job=job_number, input_path=src_tif,
+							  output_path=output_path or "", message=name_note)
+
+			if output_path is None:
+				skipped += 1
+				status = "skipped_invalid_name"
+			elif src_tif in name_collisions:
+				skipped += 1
+				collision_count += 1
+				status = "skipped_name_collision"
+				message = f"More than one source maps to output name: {output_path}"
+				print(f"NAME COLLISION: {message}")
+				run_report.record("check_output_name", "warning", client=client_code,
+							  project_or_job=job_number, input_path=src_tif,
+							  output_path=output_path, message=message)
+			elif is_valid_existing_output(output_path):
 				print(f"Already reprojected, skipping: {output_path}\n")
 				already_done += 1
 				status = "skipped_already_exists"
@@ -473,7 +417,7 @@ def main():
 				"job_number": job_number,
 				"type": type_tag,
 				"input_path": str(src_tif),
-				"output_file_path": str(output_path),
+				"output_file_path": str(output_path) if output_path is not None else "",
 				"status": status,
 			})
 			report_handle.flush()
@@ -481,10 +425,12 @@ def main():
 	print(f"Report written: {REPORT_CSV}")
 	print(
 		f"\nFinished: {processed} COG files created, "
-		f"{already_done} already done, {skipped} skipped"
+		f"{already_done} already done, {skipped} skipped, "
+		f"{collision_count} naming collisions, {naming_review_count} naming review(s)"
 	)
 	run_report.record("run", "completed" if skipped == 0 else "completed_with_issues",
-				  message=f"processed={processed}; already_done={already_done}; skipped={skipped}",
+				  message=(f"processed={processed}; already_done={already_done}; skipped={skipped}; "
+						   f"name_collisions={collision_count}; naming_reviews={naming_review_count}"),
 				  output_path=REPORT_CSV)
 	return 1 if run_report.issue_count else 0
 
