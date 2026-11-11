@@ -19,14 +19,13 @@ except Exception as error:
 
 # ---- configuration ----
 BASE_DIR = Path(r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Client")
-CLIENT_FOLDERS = {
-    "CVE": "Cenovus",
-    "TOU": "Tourmaline",
-    "WCP": "Whitecap",
+CLIENT_CODES = {
+    "Cenovus": "CVE",
+    "Tourmaline": "TOU",
+    "Whitecap": "WCP",
 }
 REPORT_CSV = Path(r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Staging\UAV_Reports\4_reproject_report.csv")
 RENAME_REPORT_CSV = Path(r"\\IGG-QNAP12\IGG_Archive\IGG\Z_Drive\Staging\UAV_Reports\4_reproject_dsm_dtm_ouput.csv")
-DRY_RUN = False
 
 MONTHS = {
     "jan": "01",
@@ -59,12 +58,6 @@ CANONICAL_NAME_PATTERN = re.compile(
     r"^(?P<day>\d{2})-(?P<month>\d{2})-(?P<year>\d{4})-(?P<type>DSM|DTM)(?P<suffix>(?:-.+)?)$",
     re.IGNORECASE,
 )
-
-# (client_folder, type_tag) pairs that must always be regenerated, bypassing
-# the existing-output check — used for one-off fixes without touching other clients.
-# Left empty: the old bad Tourmaline DSM COGs were already deleted manually, so a
-# resumed run can safely skip whatever's already been (re)done with the fix below.
-FORCE_REPROCESS_SCOPE = set()
 
 # Float32 max — the sentinel some UAV software burns in for out-of-footprint fill pixels.
 FALLBACK_NODATA_SENTINEL = 3.4028235e+38
@@ -215,13 +208,21 @@ def is_valid_existing_output(path):
 
 def iter_source_tifs():
     """Yield (client, project, type_tag, source_tif, output_dir) for each DSM/DTM tif."""
-    for client_code, client_folder in CLIENT_FOLDERS.items():
+    try:
+        client_dirs = sorted((path for path in BASE_DIR.iterdir() if path.is_dir()), key=lambda path: path.name.casefold())
+    except OSError as error:
+        run_report.exception("discover_client_directories", error, input_path=BASE_DIR)
+        return
+
+    for client_dir in client_dirs:
+        client_folder = client_dir.name
+        client_code = CLIENT_CODES.get(client_folder, client_folder)
         for type_tag, base_subdir in (("DSM", "FullFeature"), ("DTM", "BareEarth")):
-            type_root = BASE_DIR / client_folder / "LiDAR" / "UAV" / base_subdir
+            type_root = client_dir / "LiDAR" / "UAV" / base_subdir
             if not type_root.is_dir():
-                run_report.record("discover_source_root", "warning", client=client_folder,
+                run_report.record("discover_source_root", "info", client=client_folder,
                                   data_type=type_tag, input_path=type_root,
-                                  message="Configured source root is missing or inaccessible")
+                                  message="No UAV LiDAR source folder for this client/type; skipped")
                 continue
             for project_dir in sorted(type_root.iterdir()):
                 if not project_dir.is_dir():
@@ -239,15 +240,17 @@ def iter_source_tifs():
 
 
 def expected_tif_name(tif_path, type_tag):
-    """Return the canonical name, falling back to the file's modified date."""
+    """Return a canonical DSM/DTM name, or None when its suffix is too long."""
 
     def modified_date_fallback():
         try:
             modified = datetime.fromtimestamp(tif_path.stat().st_mtime)
         except OSError:
             return None
-        # Keep the original stem as a suffix to distinguish files with no date.
-        return f"{modified:%d-%m-%Y}-{type_tag}-{tif_path.stem}{tif_path.suffix}"
+        suffix = re.sub(r"[^A-Za-z0-9]+", "-", tif_path.stem).strip("-")
+        if len(suffix) > 20:
+            return None
+        return f"{modified:%d-%m-%Y}-{type_tag}{f'-{suffix}' if suffix else ''}{tif_path.suffix}"
 
     stem = tif_path.stem
     canonical_match = CANONICAL_NAME_PATTERN.fullmatch(stem)
@@ -256,6 +259,8 @@ def expected_tif_name(tif_path, type_tag):
         month = canonical_match.group("month")
         year = canonical_match.group("year")
         suffix = canonical_match.group("suffix")
+        if len((suffix or "").lstrip("-")) > 20:
+            return None
     else:
         date_match = next((pattern.search(stem) for pattern in DATE_NAME_PATTERNS if pattern.search(stem)), None)
         if not date_match:
@@ -275,7 +280,12 @@ def expected_tif_name(tif_path, type_tag):
     except ValueError:
         return modified_date_fallback()
 
-    return f"{day}-{month}-{year}-{type_tag}{suffix}{tif_path.suffix}"
+    suffix = re.sub(r"^[- _]+", "", suffix or "")
+    suffix = re.sub(r"[ _]+", "-", suffix)
+    suffix = re.sub(r"-+", "-", suffix).strip("-")
+    if len(suffix) > 20:
+        return None
+    return f"{day}-{month}-{year}-{type_tag}{f'-{suffix}' if suffix else ''}{tif_path.suffix}"
 
 
 def sidecar_rename_pairs(tif_path, target_path):
@@ -306,183 +316,256 @@ def sidecar_rename_pairs(tif_path, target_path):
     return pairs
 
 
-def preview_or_apply_renames():
-    """Preview or apply canonical DSM/DTM source names before reprojection."""
-    rows = []
-    rename_plans = []
-    planned_targets = {}
+def rename_file_group(file_pairs):
+    """Rename TIFFs and sidecars as one staged group, rolling back on failure."""
+    staged = []
+    try:
+        for source_path, target_path in file_pairs:
+            temp_path = source_path.with_name(f".__uav_lidar_rename_{time.time_ns()}_{len(staged)}.tmp")
+            while temp_path.exists():
+                temp_path = source_path.with_name(f".__uav_lidar_rename_{time.time_ns()}_{len(staged)}.tmp")
+            source_path.rename(temp_path)
+            staged.append((source_path, temp_path, target_path, False))
 
-    for client_code, project, type_tag, tif_path, _ in iter_source_tifs():
+        for index, (source_path, temp_path, target_path, _) in enumerate(staged):
+            temp_path.rename(target_path)
+            staged[index] = (source_path, temp_path, target_path, True)
+    except Exception:
+        for source_path, temp_path, target_path, completed in reversed(staged):
+            try:
+                if completed and target_path.exists():
+                    target_path.rename(temp_path)
+                if temp_path.exists():
+                    temp_path.rename(source_path)
+            except OSError as rollback_error:
+                run_report.exception("rollback_source_rename", rollback_error,
+                                 input_path=temp_path, output_path=source_path)
+        raise
+
+
+def prepare_source_records():
+    """Check existing COGs first, then preflight new-source names and sidecars."""
+    records = []
+    pending = []
+    for client_code, project, type_tag, tif_path, output_dir in iter_source_tifs():
+        try:
+            matching_outputs = [
+                candidate for candidate in output_dir.iterdir()
+                if candidate.is_file()
+                and candidate.suffix.casefold() in {".tif", ".tiff"}
+                and candidate.stem.casefold() == tif_path.stem.casefold()
+            ]
+        except OSError as error:
+            run_report.exception("find_existing_lidar_cog", error, client=client_code,
+                             project_or_job=project, input_path=tif_path, output_path=output_dir)
+            records.append({"client": client_code, "project": project, "type": type_tag,
+                "input_path": tif_path, "source_path": tif_path, "output_path": "",
+                "status": "output_folder_error", "message": str(error)})
+            continue
+
+        valid_matches = [path for path in matching_outputs if is_valid_existing_output(path)]
+        if valid_matches:
+            records.append({"client": client_code, "project": project, "type": type_tag,
+                "input_path": tif_path, "source_path": tif_path, "output_path": valid_matches[0],
+                "status": "skipped_already_exists",
+                "message": "Same-basename COG exists; source, COG, and sidecars left unchanged"})
+            continue
+        if matching_outputs:
+            message = "Same-basename output exists but is invalid; source and files left untouched"
+            records.append({"client": client_code, "project": project, "type": type_tag,
+                "input_path": tif_path, "source_path": tif_path, "output_path": matching_outputs[0],
+                "status": "skipped_invalid_same_name_output", "message": message})
+            run_report.record("check_existing_output", "warning", client=client_code,
+                          project_or_job=project, input_path=tif_path,
+                          output_path=matching_outputs[0], message=message)
+            continue
+
         expected_name = expected_tif_name(tif_path, type_tag)
         if expected_name is None:
-            rows.append({
-                "client": client_code,
-                "project": project,
-                "type": type_tag,
-                "input_path": str(tif_path),
-                "output_path": "",
-                "status": "invalid_name",
-                "message": "Could not find a valid filename date or read the file modified date",
-            })
+            message = "Could not derive a safe name or qualifier exceeds 20 characters"
+            records.append({"client": client_code, "project": project, "type": type_tag,
+                "input_path": tif_path, "source_path": tif_path, "output_path": "",
+                "status": "invalid_name", "message": message})
+            run_report.record("name_new_source", "warning", client=client_code,
+                          project_or_job=project, input_path=tif_path, message=message)
             continue
 
-        target_path = tif_path.with_name(expected_name)
-        if target_path == tif_path:
-            rows.append({
-                "client": client_code,
-                "project": project,
-                "type": type_tag,
-                "input_path": str(tif_path),
-                "output_path": str(target_path),
-                "status": "already_correct",
-                "message": "",
-            })
-            continue
-
-        sidecar_pairs = sidecar_rename_pairs(tif_path, target_path)
-        file_pairs = [(tif_path, target_path), *sidecar_pairs]
-        collision_message = ""
-        for _, planned_path in file_pairs:
-            target_key = str(planned_path).casefold()
-            if planned_path.exists():
-                collision_message = f"Target already exists: {planned_path}"
-                break
-            if target_key in planned_targets:
-                collision_message = f"Target duplicates {planned_targets[target_key]}"
-                break
-
-        if collision_message:
-            rows.append({
-                "client": client_code,
-                "project": project,
-                "type": type_tag,
-                "input_path": str(tif_path),
-                "output_path": str(target_path),
-                "status": "collision",
-                "message": collision_message,
-            })
-            continue
-
-        for source_path, planned_path in file_pairs:
-            planned_targets[str(planned_path).casefold()] = str(source_path)
-        rename_plans.append((tif_path, target_path, sidecar_pairs))
-        rows.append({
-            "client": client_code,
-            "project": project,
-            "type": type_tag,
-            "input_path": str(tif_path),
-            "output_path": str(target_path),
-            "status": "preview_rename" if DRY_RUN else "renamed",
-            "message": "",
+        target_source = tif_path.with_name(expected_name)
+        pending.append({
+            "client": client_code, "project": project, "type": type_tag,
+            "input_path": tif_path, "source_path": target_source,
+            "output_dir": output_dir, "output_path": output_dir / expected_name,
+            "needs_rename": target_source != tif_path,
+            "sidecars": sidecar_rename_pairs(tif_path, target_source) if target_source != tif_path else [],
+            "status": "pending", "message": "",
         })
 
-    if not DRY_RUN:
-        for source_path, target_path, sidecar_pairs in rename_plans:
-            try:
-                for sidecar_source, sidecar_target in sidecar_pairs:
-                    sidecar_source.rename(sidecar_target)
-                source_path.rename(target_path)
-                run_report.record("rename_source_and_sidecars", "completed",
-                                  input_path=source_path, output_path=target_path,
-                                  message=f"Renamed {len(sidecar_pairs)} sidecar(s)")
-            except Exception as error:
-                row = next(row for row in rows if row["input_path"] == str(source_path))
-                row["status"] = "rename_failed"
-                row["message"] = f"{type(error).__name__}: {error}"
-                run_report.exception("rename_source_and_sidecars", error,
-                                     input_path=source_path, output_path=target_path,
-                                     details=f"Sidecars planned: {sidecar_pairs}")
+    move_sources = {
+        path for record in pending if record["needs_rename"]
+        for path in [record["input_path"], *(source for source, _ in record["sidecars"])]
+    }
+    reserved = {}
+    pending.sort(key=lambda record: str(record["input_path"]).casefold())
+    for record in pending:
+        base_stem = record["source_path"].stem
+        extension = record["source_path"].suffix
+        part = 1
+        while True:
+            candidate_stem = base_stem if part == 1 else f"{base_stem}-Part{part}"
+            candidate_source = record["input_path"].with_name(candidate_stem + extension)
+            candidate_output = record["output_dir"] / candidate_source.name
+            candidate_sidecars = (
+                sidecar_rename_pairs(record["input_path"], candidate_source)
+                if candidate_source != record["input_path"] else []
+            )
+            pairs = ([(record["input_path"], candidate_source)] if candidate_source != record["input_path"] else []) + candidate_sidecars
+            collision = False
+            for _, target in pairs:
+                target_key = str(target).casefold()
+                if target_key in reserved:
+                    collision = True
+                    break
+                if target.exists() and target not in move_sources:
+                    collision = True
+                    break
+            output_key = str(candidate_output).casefold()
+            if output_key in reserved or candidate_output.exists():
+                collision = True
+            if not collision:
+                break
+            if not record["needs_rename"]:
+                record["status"] = "collision"
+                record["message"] = "Canonical name conflicts with another source or existing file; left unchanged"
+                record["source_path"] = record["input_path"]
+                record["output_path"] = candidate_output
+                run_report.record("name_collision", "warning", client=record["client"],
+                              project_or_job=record["project"], input_path=record["input_path"],
+                              output_path=candidate_output, message=record["message"])
+                break
+            part += 1
+            if part > 9999:
+                record["status"] = "collision"
+                record["message"] = "Could not allocate a unique PartN name; left unchanged"
+                record["source_path"] = record["input_path"]
+                record["output_path"] = candidate_output
+                break
 
-    with open(RENAME_REPORT_CSV, "w", newline="") as report_handle:
-        writer = csv.DictWriter(
-            report_handle,
-            fieldnames=["client", "project", "type", "input_path", "output_path", "status", "message"],
-        )
+        if record["status"] != "pending":
+            continue
+        record["source_path"] = candidate_source
+        record["output_path"] = candidate_output
+        record["sidecars"] = candidate_sidecars
+        for source_path, target in pairs:
+            reserved[str(target).casefold()] = source_path
+        reserved[str(candidate_output).casefold()] = record["input_path"]
+
+    rename_pairs = [
+        pair for record in pending if record["status"] == "pending"
+        for pair in ([(record["input_path"], record["source_path"])] if record["needs_rename"] else [])
+        + record["sidecars"]
+    ]
+    if rename_pairs:
+        try:
+            rename_file_group(rename_pairs)
+        except Exception as error:
+            for record in pending:
+                if record["status"] == "pending" and record["needs_rename"]:
+                    record["status"] = "rename_failed"
+                    record["message"] = f"{type(error).__name__}: {error}"
+                    run_report.exception("rename_source_and_sidecars", error, client=record["client"],
+                                     project_or_job=record["project"], input_path=record["input_path"],
+                                     output_path=record["source_path"])
+        else:
+            for record in pending:
+                if record["status"] == "pending" and record["needs_rename"]:
+                    run_report.record("rename_source_and_sidecars", "completed", client=record["client"],
+                                  project_or_job=record["project"], input_path=record["input_path"],
+                                  output_path=record["source_path"],
+                                  message=f"Renamed source and {len(record['sidecars'])} sidecar(s)")
+	
+    records.extend(pending)
+
+    with RENAME_REPORT_CSV.open("w", newline="", encoding="utf-8-sig") as report_handle:
+        writer = csv.DictWriter(report_handle,
+            fieldnames=["client", "project", "type", "input_path", "output_path", "status", "message"])
         writer.writeheader()
-        writer.writerows(rows)
-
-    rename_failures = [row for row in rows if row["status"] == "rename_failed"]
-    if rename_failures:
-        raise OSError(f"{len(rename_failures)} TIFF rename operation(s) failed; see {RENAME_REPORT_CSV}")
-
-    for row in rows:
-        if row["status"] in {"collision", "invalid_name"}:
-            run_report.record("rename_preflight", "warning", client=row["client"],
-                              project_or_job=row["project"], data_type=row["type"],
-                              input_path=row["input_path"], output_path=row["output_path"],
-                              message=row["message"] or row["status"])
-
-    print(f"Rename report written: {RENAME_REPORT_CSV}")
-    print(f"Rename preview: {sum(row['status'] == 'preview_rename' for row in rows)} files")
-    print(f"Already correct: {sum(row['status'] == 'already_correct' for row in rows)} files")
-    print(f"Collisions: {sum(row['status'] == 'collision' for row in rows)} files")
-    print(f"Invalid names: {sum(row['status'] == 'invalid_name' for row in rows)} files")
-    sidecar_label = "Sidecars renamed" if not DRY_RUN else "Sidecars to rename"
-    print(f"{sidecar_label}: {sum(len(plan[2]) for plan in rename_plans)} files")
+        for record in records:
+            writer.writerow({key: str(record.get(key, "") or "") for key in writer.fieldnames})
+    print(f"Rename/status report written: {RENAME_REPORT_CSV}")
+    return records
 
 
 def main():
     run_report.record("run", "started", message="LiDAR rename and reprojection run started",
-                      details=f"BASE_DIR={BASE_DIR}; DRY_RUN={DRY_RUN}; target_crs={TARGET_CRS_CODE}")
-    preview_or_apply_renames()
-    if DRY_RUN:
-        print("DRY_RUN is enabled; stopping after rename preview.")
-        return
+                      details=f"BASE_DIR={BASE_DIR}; target_crs={TARGET_CRS_CODE}")
+    records = prepare_source_records()
 
     processed = 0
     skipped = 0
     already_done = 0
 
     with open(REPORT_CSV, "w", newline="") as report_handle:
-        writer = csv.DictWriter(report_handle, fieldnames=["client", "project", "type", "input_path", "output_file_path", "status"])
+        writer = csv.DictWriter(
+            report_handle,
+            fieldnames=["client", "project", "type", "input_path", "renamed_source_path",
+                        "output_file_path", "status", "message"],
+        )
         writer.writeheader()
 
-        for client_code, project, type_tag, src_tif, output_dir in iter_source_tifs():
-            output_path = output_dir / src_tif.name
-            force_reprocess = (CLIENT_FOLDERS[client_code], type_tag) in FORCE_REPROCESS_SCOPE
+        for record in records:
+            client_code = record["client"]
+            project = record["project"]
+            type_tag = record["type"]
+            input_path = record["input_path"]
+            src_tif = record["source_path"]
+            output_path = record["output_path"]
+            status = record["status"]
+            message = record["message"]
 
-            if not force_reprocess and is_valid_existing_output(output_path):
-                print(f"Already reprojected, skipping: {output_path}\n")
+            if status == "skipped_already_exists":
+                print(f"Already reprojected, skipping without changes: {output_path}\n")
                 already_done += 1
-                status = "skipped_already_exists"
-                run_report.record("reprojection", "skipped", client=client_code,
-                                  project_or_job=project, data_type=type_tag,
-                                  input_path=src_tif, output_path=output_path,
-                                  message="Existing output opened successfully; reproject skipped")
-            else:
+            elif status == "pending":
                 try:
                     if output_path.exists():
-                        output_path.unlink()  # remove partial/corrupt file, or force a clean rebuild
+                        raise FileExistsError(f"Refusing to overwrite an existing output: {output_path}")
                     if create_cog_from_tif(src_tif, output_path, TARGET_CRS_CODE):
                         print(f"Done: {output_path}\n")
                         processed += 1
-                        status = "reprocessed_nodata_fix" if force_reprocess else "completed"
+                        status = "completed"
+                        message = "COG created successfully"
                         run_report.record("reprojection", "completed", client=client_code,
                                           project_or_job=project, data_type=type_tag,
                                           input_path=src_tif, output_path=output_path,
-                                          message="COG created successfully")
+                                          message=message)
                     else:
                         skipped += 1
-                        status = "skipped"
+                        status = "failed"
+                        message = "COG creation returned failure; inspect preceding diagnostic events"
                         run_report.record("reprojection", "failed", client=client_code,
                                           project_or_job=project, data_type=type_tag,
                                           input_path=src_tif, output_path=output_path,
-                                          message="COG creation returned failure; inspect preceding diagnostic events")
+                                          message=message)
                 except Exception as e:
                     print(f"Error processing {src_tif}: {str(e)}\n")
                     skipped += 1
-                    status = "skipped"
+                    status = "failed"
+                    message = f"{type(e).__name__}: {e}"
                     run_report.exception("reprojection", e, client=client_code,
                                          project_or_job=project, data_type=type_tag,
                                          input_path=src_tif, output_path=output_path)
+            else:
+                skipped += 1
 
             writer.writerow({
                 "client": client_code,
                 "project": project,
                 "type": type_tag,
-                "input_path": str(src_tif),
-                "output_file_path": str(output_path),
+                "input_path": str(input_path),
+                "renamed_source_path": str(src_tif),
+                "output_file_path": str(output_path) if output_path else "",
                 "status": status,
+                "message": message,
             })
             report_handle.flush()
 
