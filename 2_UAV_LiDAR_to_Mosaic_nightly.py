@@ -322,7 +322,7 @@ def build_production_overviews(mosaic_dataset_path):
         # Items added with NO_CELL_SIZES have blank MinPS/MaxPS and do not draw.
         arcpy.management.CalculateCellSizeRanges(
             in_mosaic_dataset=mosaic_dataset_path,
-            query_definition="Category = 1 AND (MinPS IS NULL OR MaxPS IS NULL OR (MinPS = 0 AND MaxPS = 0))",
+            where_clause="Category = 1 AND (MinPS IS NULL OR MaxPS IS NULL OR (MinPS = 0 AND MaxPS = 0))",
         )
         arcpy.management.BuildOverviews(
             in_mosaic_dataset=mosaic_dataset_path,

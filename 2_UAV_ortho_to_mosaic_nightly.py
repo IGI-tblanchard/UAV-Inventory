@@ -74,6 +74,7 @@ def iter_output_tifs():
 				if path.is_file()
 				and path.suffix.casefold() in {".tif", ".tiff"}
 				and "-mosaic" in path.stem.casefold()
+				and "reduced" not in path.stem.casefold()
 			)
 			for tif_path in tif_paths:
 				yield client_code, client_folder, job_dir.name, mosaic_name, tif_path

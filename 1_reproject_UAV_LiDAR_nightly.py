@@ -2,6 +2,7 @@ import csv
 import math
 import re
 import sys
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 
@@ -41,16 +42,27 @@ MONTHS = {
     "nov": "11",
     "dec": "12",
 }
+MONTHS.update({
+    "january": "01",
+    "february": "02",
+    "march": "03",
+    "april": "04",
+    "june": "06",
+    "july": "07",
+    "august": "08",
+    "september": "09",
+    "october": "10",
+    "november": "11",
+    "december": "12",
+})
 
 DATE_NAME_PATTERNS = (
     re.compile(
-        r"(?P<month>[A-Za-z]{3})[- ](?P<day>\d{1,2})[- ](?P<year>\d{4})"
-        r"(?:[- _]*(?P<embedded_type>DSM|DTM))?(?P<suffix>(?:[- _]+.+)?)$",
+        r"(?<!\d)(?P<month>[A-Za-z]{3,9})[- _]+(?P<day>\d{1,2})[- _]+(?P<year>\d{4})(?!\d)",
         re.IGNORECASE,
     ),
     re.compile(
-        r"(?P<day>\d{1,2})[- ](?P<month>[A-Za-z]{3})[- ](?P<year>\d{4})"
-        r"(?:[- _]*(?P<embedded_type>DSM|DTM))?(?P<suffix>(?:[- _]+.+)?)$",
+        r"(?<!\d)(?P<day>\d{1,2})[- _]+(?P<month>[A-Za-z]{3,9})[- _]+(?P<year>\d{4})(?!\d)",
         re.IGNORECASE,
     ),
 )
@@ -265,24 +277,23 @@ def expected_tif_name(tif_path, type_tag):
         date_match = next((pattern.search(stem) for pattern in DATE_NAME_PATTERNS if pattern.search(stem)), None)
         if not date_match:
             return modified_date_fallback()
-        month = MONTHS.get(date_match.group("month").lower())
+        month_text = date_match.group("month").lower()
+        month = MONTHS.get(month_text) or MONTHS.get(month_text[:3])
         if month is None:
             return modified_date_fallback()
         day = date_match.group("day").zfill(2)
         year = date_match.group("year")
-        suffix = date_match.group("suffix") or ""
-        if date_match.group("embedded_type"):
-            suffix = re.sub(r"^[- _]+", "", suffix)
-            suffix = f"-{suffix}" if suffix else ""
+        residual = stem[:date_match.start()] + " " + stem[date_match.end():]
+        residual = re.sub(r"(?i)(?<![A-Za-z])(?:DSM|DTM)(?![A-Za-z])", " ", residual)
+        residual = re.sub(r"(?<!\d)\d{5}(?!\d)", " ", residual)
+        suffix = re.sub(r"[^A-Za-z0-9]+", "-", residual).strip("-")
 
     try:
         date(int(year), int(month), int(day))
     except ValueError:
         return modified_date_fallback()
 
-    suffix = re.sub(r"^[- _]+", "", suffix or "")
-    suffix = re.sub(r"[ _]+", "-", suffix)
-    suffix = re.sub(r"-+", "-", suffix).strip("-")
+    suffix = re.sub(r"-+", "-", suffix or "").strip("-")
     if len(suffix) > 20:
         return None
     return f"{day}-{month}-{year}-{type_tag}{f'-{suffix}' if suffix else ''}{tif_path.suffix}"
@@ -321,9 +332,9 @@ def rename_file_group(file_pairs):
     staged = []
     try:
         for source_path, target_path in file_pairs:
-            temp_path = source_path.with_name(f".__uav_lidar_rename_{time.time_ns()}_{len(staged)}.tmp")
+            temp_path = source_path.with_name(f".__uav_lidar_rename_{uuid.uuid4().hex}.tmp")
             while temp_path.exists():
-                temp_path = source_path.with_name(f".__uav_lidar_rename_{time.time_ns()}_{len(staged)}.tmp")
+                temp_path = source_path.with_name(f".__uav_lidar_rename_{uuid.uuid4().hex}.tmp")
             source_path.rename(temp_path)
             staged.append((source_path, temp_path, target_path, False))
 
