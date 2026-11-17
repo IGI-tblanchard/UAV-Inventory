@@ -1,9 +1,13 @@
 """Reproject client UAV orthomosaics to Cloud Optimized GeoTIFFs."""
 
 import csv
+import json
 import math
+import os
 import re
+import stat
 import sys
+import tempfile
 import uuid
 from datetime import date, datetime
 from pathlib import Path
@@ -93,7 +97,7 @@ TARGET_CRS_CODE = "EPSG:2955"  # NAD83(CSRS) UTM Zone 11N
 
 try:
 	gdal.UseExceptions()
-	gdal.SetConfigOption("GDAL_PAM_ENABLED", "NO")
+	gdal.SetConfigOption("GDAL_PAM_ENABLED", "YES")
 	gdal.SetConfigOption("GDAL_CACHEMAX", "1024")
 	gdal.SetConfigOption("GDAL_NUM_THREADS", "ALL_CPUS")
 except Exception as error:
@@ -123,6 +127,9 @@ def create_cog_from_tif(src_tif_path, output_path, target_crs_code):
 			run_report.record("open_source_raster", "failed", input_path=src_tif_path,
 						  output_path=output_path, message="GDAL could not open source raster")
 			return False
+		reason = rgba_problem(src_ds)
+		if reason:
+			raise ValueError(f"Source changed or is not RGBA: {reason}")
 
 		src_crs = osr.SpatialReference(wkt=src_ds.GetProjection())
 		src_crs_name = (
@@ -208,51 +215,168 @@ def create_cog_from_tif(src_tif_path, output_path, target_crs_code):
 		return False
 
 
-def is_valid_existing_output(path):
-	"""Return True if path is a TIFF GDAL can open with a valid raster."""
-	try:
-		if not path.exists() or path.stat().st_size == 0:
-			return False
-		dataset = gdal.Open(str(path))
-	except Exception:
-		return False
+def rgba_problem(dataset):
+	"""Return a reason unless the raster has explicitly identified RGBA bands."""
 	if dataset is None:
+		raise ValueError("GDAL could not open raster")
+	if dataset.RasterXSize < 1 or dataset.RasterYSize < 1:
+		raise ValueError("Raster has invalid dimensions")
+	if dataset.RasterCount != 4:
+		return f"Expected four RGBA bands; found {dataset.RasterCount}"
+	bands = [dataset.GetRasterBand(i) for i in range(1, 5)]
+	if any(band is None for band in bands):
+		raise ValueError("GDAL could not read raster band metadata")
+	roles = [band.GetColorInterpretation() for band in bands]
+	expected = [gdal.GCI_RedBand, gdal.GCI_GreenBand, gdal.GCI_BlueBand, gdal.GCI_AlphaBand]
+	if roles != expected:
+		return f"Band color interpretations are not Red, Green, Blue, Alpha: {roles}"
+	if any(band.GetColorTable() is not None for band in bands):
+		return "RGBA bands must not have a color table"
+	return ""
+
+
+def existing_output_problem(path, full_check=False):
+	"""Explain why an existing raster cannot be treated as an RGBA output."""
+	try:
+		if path.stat().st_size == 0:
+			return "Output is empty"
+		dataset = gdal.Open(str(path))
+		problem = rgba_problem(dataset)
+		if problem:
+			return problem
+		target = osr.SpatialReference()
+		if target.ImportFromEPSG(2955) != 0:
+			raise ValueError("Could not construct EPSG:2955")
+		actual = dataset.GetSpatialRef()
+		if actual is None or not actual.IsSame(target):
+			return "Output CRS is not EPSG:2955"
+		if dataset.GetGeoTransform(can_return_null=True) is None:
+			return "Output geotransform is missing"
+		# Existing files are checked without repeatedly reading entire large COGs
+		# over the network. Newly created files receive the full block check.
+		height = dataset.RasterYSize if full_check else min(dataset.RasterYSize, 512)
+		width = dataset.RasterXSize if full_check else min(dataset.RasterXSize, 512)
+		for y in range(0, height, 512):
+			for x in range(0, width, 512):
+				if dataset.ReadRaster(x, y, min(512, dataset.RasterXSize - x),
+						min(512, dataset.RasterYSize - y)) is None:
+					return "Cannot decode output raster pixels"
+		return ""
+	except Exception as error:
+		return f"Cannot validate output: {type(error).__name__}: {error}"
+
+
+def is_valid_existing_output(path):
+	return not existing_output_problem(path)
+
+
+def optional_directory(path):
+	"""Treat only a missing optional directory as absent; propagate access errors."""
+	try:
+		return stat.S_ISDIR(path.stat().st_mode)
+	except FileNotFoundError:
 		return False
-	valid = dataset.RasterXSize > 0 and dataset.RasterYSize > 0
-	dataset = None
-	return valid
+
+
+def queue_configuration():
+	"""Remove a previous run's queue before discovery and validate configuration."""
+	queue_name = os.environ.get("UAV_REPAIR_QUEUE", "")
+	run_id = os.environ.get("UAV_REPAIR_RUN_ID", "")
+	queue_name = queue_name if queue_name.strip() else ""
+	run_id = run_id if run_id.strip() else ""
+	if queue_name:
+		queue_path = Path(queue_name).absolute()
+		queue_path.unlink(missing_ok=True)
+	else:
+		queue_path = None
+	if bool(queue_path) != bool(run_id):
+		raise ValueError("UAV_REPAIR_QUEUE and UAV_REPAIR_RUN_ID must both be set or both be unset")
+	return queue_path, run_id
+
+
+def publish_repair_queue(queue_path, run_id, items):
+	"""Publish the complete run queue by replacing a temporary file in its directory."""
+	temp_path = None
+	try:
+		with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=queue_path.parent,
+				prefix=f".{queue_path.name}.", suffix=".tmp", delete=False) as handle:
+			temp_path = Path(handle.name)
+			json.dump({"version": 1, "run_id": run_id, "complete": True, "items": items}, handle, indent=2)
+			handle.flush()
+			os.fsync(handle.fileno())
+		os.replace(temp_path, queue_path)
+	finally:
+		if temp_path is not None:
+			temp_path.unlink(missing_ok=True)
+
+
+def create_cog_without_overwrite(source_path, output_path, target_crs_code):
+	"""Create in the output directory, then atomically publish without replacement."""
+	temp_path = output_path.with_name(f".__uav_ortho_{uuid.uuid4().hex}.tif")
+	sidecar_paths = output_sidecar_paths(output_path)
+	try:
+		if output_path.exists():
+			raise FileExistsError(f"Refusing to overwrite an existing output: {output_path}")
+		for sidecar in sidecar_paths:
+			if os.path.lexists(sidecar):
+				raise FileExistsError(f"Refusing to publish beside an existing output sidecar: {sidecar}")
+		if not create_cog_from_tif(source_path, temp_path, target_crs_code):
+			return False
+		if any(Path(str(temp_path) + suffix).exists() for suffix in (".aux.xml", ".msk", ".ovr")):
+			raise RuntimeError("Temporary COG depends on sidecars and cannot be published safely")
+		problem = existing_output_problem(temp_path, full_check=True)
+		if problem:
+			raise ValueError(f"Temporary COG failed validation: {problem}")
+		if os.name == "nt":
+			os.rename(temp_path, output_path)
+		else:
+			os.link(temp_path, output_path)
+		return True
+	finally:
+		temp_path.unlink(missing_ok=True)
+		for suffix in (".aux.xml", ".msk", ".ovr"):
+			Path(str(temp_path) + suffix).unlink(missing_ok=True)
+
+
+def output_sidecar_paths(output_path):
+	"""Return common files that can alter a TIFF's metadata or displayed pixels."""
+	return (
+		Path(str(output_path) + ".aux.xml"),
+		Path(str(output_path) + ".msk"),
+		Path(str(output_path) + ".ovr"),
+		output_path.with_suffix(".tfw"),
+		output_path.with_suffix(".tifw"),
+		output_path.with_suffix(".wld"),
+		output_path.with_suffix(".prj"),
+	)
 
 
 def iter_source_tifs():
 	"""Yield (client, job number, type, source TIFF, job output directory)."""
-	try:
-		client_dirs = sorted((path for path in BASE_DIR.iterdir() if path.is_dir()), key=lambda path: path.name.casefold())
-	except OSError as error:
-		run_report.exception("discover_client_directories", error, input_path=BASE_DIR)
-		return
+	client_dirs = sorted((path for path in BASE_DIR.iterdir() if stat.S_ISDIR(path.stat().st_mode)), key=lambda path: path.name.casefold())
 
 	for client_dir in client_dirs:
 		client_folder = client_dir.name
 		client_code = CLIENT_CODES.get(client_folder, client_folder)
 		client_root = client_dir / SOURCE_SUBDIRECTORY
-		if not client_root.is_dir():
+		if not optional_directory(client_root):
 			run_report.record("discover_source_root", "info", client=client_folder,
 						  input_path=client_root,
 						  message="No UAV source folder for this client; skipped")
 			continue
 
 		for job_dir in sorted(client_root.iterdir()):
-			if not job_dir.is_dir():
+			if not stat.S_ISDIR(job_dir.stat().st_mode):
 				continue
 			ortho_dir = job_dir / SOURCE_ORTHO_FOLDER
-			if not ortho_dir.is_dir():
+			if not optional_directory(ortho_dir):
 				run_report.record("discover_ortho_folder", "info", client=client_folder,
 							  project_or_job=job_dir.name, input_path=ortho_dir,
 							  message="No Orthomosaic source folder in this job; skipped")
 				continue
-			tif_paths = sorted(ortho_dir.glob("*.tif")) + sorted(
-				ortho_dir.glob("*.tiff")
-			)
+			tif_paths = sorted(path for path in ortho_dir.iterdir()
+				if path.suffix.casefold() in {".tif", ".tiff"}
+				and stat.S_ISREG(path.stat().st_mode))
 			for tif_path in tif_paths:
 				yield client_code, job_dir.name, "Mosaic", tif_path, job_dir
 
@@ -414,59 +538,107 @@ def rename_file_group(file_pairs):
 def main():
 	run_report.record("run", "started", message="Orthomosaic reprojection run started",
 				  details=f"BASE_DIR={BASE_DIR}; target_crs={TARGET_CRS_CODE}")
+	queue_path, run_id = queue_configuration()
 	source_items = list(iter_source_tifs())
 	records = []
 	new_records = []
 	for client_code, job_number, type_tag, src_tif, output_dir in source_items:
-		matching_cogs = [
-			candidate for candidate in output_dir.iterdir()
-			if candidate.is_file()
-			and candidate.suffix.casefold() in {".tif", ".tiff"}
-			and candidate.stem.casefold() == src_tif.stem.casefold()
-		]
-		valid_matches = [candidate for candidate in matching_cogs if is_valid_existing_output(candidate)]
-		if valid_matches:
-			records.append({
-				"client": client_code, "job_number": job_number, "type": type_tag,
-				"input_path": src_tif, "source_path": src_tif,
-				"output_path": valid_matches[0], "status": "skipped_already_exists",
-				"message": "Same-basename COG exists; source, COG, and sidecars left unchanged",
-			})
-			continue
-		if matching_cogs:
-			message = "Same-basename output exists but is not a valid raster; left untouched"
-			records.append({
-				"client": client_code, "job_number": job_number, "type": type_tag,
-				"input_path": src_tif, "source_path": src_tif,
-				"output_path": matching_cogs[0], "status": "skipped_invalid_same_name_output",
-				"message": message,
-			})
-			run_report.record("check_existing_output", "warning", client=client_code,
-						  project_or_job=job_number, input_path=src_tif,
-						  output_path=matching_cogs[0], message=message)
-			continue
+		try:
+			matching_cogs = sorted(
+				candidate for candidate in output_dir.iterdir()
+				if candidate.suffix.casefold() in {".tif", ".tiff"}
+				and candidate.stem.casefold() == src_tif.stem.casefold()
+				and stat.S_ISREG(candidate.stat().st_mode)
+			)
+			if matching_cogs:
+				# An existing output takes precedence over canonical source naming.
+				# This avoids warning on oddly named sources that already have a
+				# usable same-basename COG.
+				problems = [(candidate, existing_output_problem(candidate)) for candidate in matching_cogs]
+				valid = [(candidate, problem) for candidate, problem in problems if not problem]
+				if valid:
+					records.append({"client": client_code, "job_number": job_number, "type": type_tag,
+						"input_path": src_tif, "source_path": src_tif, "output_path": valid[0][0],
+						"status": "skipped_already_exists",
+						"message": "Same-basename valid COG exists; source, output, and sidecars left unchanged"})
+					continue
 
-		new_name, name_note = expected_tif_name(src_tif)
-		if new_name is None:
-			message = name_note or "Could not determine a safe source name"
-			records.append({
-				"client": client_code, "job_number": job_number, "type": type_tag,
-				"input_path": src_tif, "source_path": src_tif,
-				"output_path": "", "status": "skipped_invalid_name", "message": message,
-			})
-			run_report.record("name_new_source", "warning", client=client_code,
-						  project_or_job=job_number, input_path=src_tif, message=message)
-			continue
+				is_reduced_source = bool(
+					REDUCED_PATTERN.search(src_tif.stem)
+					or RESOLUTION_PATTERN.search(src_tif.stem)
+				)
+				if is_reduced_source:
+					candidate, problem = problems[0]
+					message = f"Reduced source ignored; same-basename output left untouched ({problem})"
+					records.append({"client": client_code, "job_number": job_number, "type": type_tag,
+						"input_path": src_tif, "source_path": src_tif, "output_path": candidate,
+						"status": "skipped_reduced", "message": message})
+					run_report.record("skip_reduced_source", "info", client=client_code,
+						project_or_job=job_number, input_path=src_tif,
+						output_path=candidate, message=message)
+					continue
 
-		target_source = src_tif.with_name(new_name)
-		new_records.append({
-			"client": client_code, "job_number": job_number, "type": type_tag,
-			"input_path": src_tif, "source_path": target_source,
-			"output_dir": output_dir, "output_path": output_dir / new_name,
-			"name_note": name_note, "needs_rename": target_source != src_tif,
-			"sidecars": matching_sidecars(src_tif, target_source) if target_source != src_tif else [],
-			"status": "pending", "message": "",
-		})
+				for candidate, problem in problems:
+					message = f"Same-basename output left untouched: {problem}"
+					records.append({"client": client_code, "job_number": job_number, "type": type_tag,
+						"input_path": src_tif, "source_path": src_tif, "output_path": candidate,
+						"status": "skipped_invalid_same_name_output", "message": message})
+					run_report.record("check_existing_output", "warning", client=client_code,
+						project_or_job=job_number, input_path=src_tif,
+						output_path=candidate, message=message)
+				continue
+
+			# Only sources without a same-basename output need canonical-name
+			# validation and Reduced detection.
+			new_name, name_note = expected_tif_name(src_tif)
+			if new_name is None:
+				is_reduced_source = bool(
+					REDUCED_PATTERN.search(src_tif.stem)
+					or RESOLUTION_PATTERN.search(src_tif.stem)
+				)
+				if is_reduced_source:
+					message = "Reduced source ignored; no safe canonical rename could be derived, left unchanged"
+					records.append({"client": client_code, "job_number": job_number, "type": type_tag,
+						"input_path": src_tif, "source_path": src_tif, "output_path": "",
+						"status": "skipped_reduced", "message": message})
+					run_report.record("skip_reduced_source", "info", client=client_code,
+						project_or_job=job_number, input_path=src_tif, message=message)
+					continue
+				message = name_note or "Could not determine a safe source name"
+				records.append({"client": client_code, "job_number": job_number, "type": type_tag,
+					"input_path": src_tif, "source_path": src_tif, "output_path": "",
+					"status": "skipped_invalid_name", "message": message})
+				run_report.record("name_new_source", "warning", client=client_code,
+					project_or_job=job_number, input_path=src_tif, message=message)
+				continue
+
+			target_source = src_tif.with_name(new_name)
+			is_reduced = "reduced" in target_source.stem.casefold()
+			if is_reduced:
+				repair_reason = ""
+			else:
+				dataset = gdal.Open(str(src_tif))
+				repair_reason = rgba_problem(dataset)
+				dataset = None
+				if repair_reason and queue_path is None:
+					raise ValueError(f"Repair required ({repair_reason}), but UAV_REPAIR_QUEUE and UAV_REPAIR_RUN_ID are not set")
+
+			new_records.append({
+				"client": client_code, "job_number": job_number, "type": type_tag,
+				"input_path": src_tif, "source_path": target_source,
+				"output_dir": output_dir, "output_path": output_dir / new_name,
+				"name_note": name_note, "needs_rename": target_source != src_tif,
+				"sidecars": matching_sidecars(src_tif, target_source) if target_source != src_tif else [],
+				"repair_reason": repair_reason, "is_reduced": is_reduced,
+				"status": "pending", "message": "",
+			})
+		except Exception as error:
+			message = f"{type(error).__name__}: {error}"
+			records.append({"client": client_code, "job_number": job_number, "type": type_tag,
+				"input_path": src_tif, "source_path": src_tif, "output_path": "",
+				"status": "failed", "message": message})
+			run_report.exception("inspect_source", error, client=client_code,
+				project_or_job=job_number, input_path=src_tif)
 
 	pending_move_sources = {
 		path for record in new_records if record["needs_rename"]
@@ -487,10 +659,18 @@ def main():
 				candidate_stem = f"{base_name}-Part{part_number}"
 			candidate_source = record["input_path"].with_name(candidate_stem + extension)
 			candidate_output = record["output_dir"] / candidate_source.name
-			candidate_sidecars = (
-				matching_sidecars(record["input_path"], candidate_source)
-				if candidate_source != record["input_path"] else []
-			)
+			try:
+				candidate_sidecars = (
+					matching_sidecars(record["input_path"], candidate_source)
+					if candidate_source != record["input_path"] else []
+				)
+			except Exception as error:
+				record["status"] = "failed"
+				record["message"] = f"{type(error).__name__}: {error}"
+				record["source_path"] = record["input_path"]
+				run_report.exception("inspect_source_sidecars", error, client=record["client"],
+					project_or_job=record["job_number"], input_path=record["input_path"])
+				break
 			pairs = ([(record["input_path"], candidate_source)] if candidate_source != record["input_path"] else []) + candidate_sidecars
 			collision = False
 			for source_path, target_path in pairs:
@@ -504,7 +684,8 @@ def main():
 			output_key = str(candidate_output).casefold()
 			if output_key in reserved_targets and reserved_targets[output_key] != record["input_path"]:
 				collision = True
-			if candidate_output.exists():
+			if not record["is_reduced"] and (candidate_output.exists() or any(os.path.lexists(sidecar)
+					for sidecar in output_sidecar_paths(candidate_output))):
 				collision = True
 			if not collision:
 				break
@@ -523,6 +704,9 @@ def main():
 				record["message"] = "Could not find an unused canonical name"
 				record["source_path"] = record["input_path"]
 				record["output_path"] = candidate_output
+				run_report.record("check_new_source_name", "warning", client=record["client"],
+					project_or_job=record["job_number"], input_path=record["input_path"],
+					output_path=candidate_output, message=record["message"])
 				break
 
 		if record["status"] != "pending":
@@ -532,7 +716,8 @@ def main():
 		record["sidecars"] = candidate_sidecars
 		for source_path, target_path in pairs:
 			reserved_targets[str(target_path).casefold()] = source_path
-		reserved_targets[output_key] = record["input_path"]
+		if not record["is_reduced"]:
+			reserved_targets[output_key] = record["input_path"]
 
 	rename_pairs = [
 		pair for record in new_records if record["status"] == "pending"
@@ -548,12 +733,45 @@ def main():
 							  input_path=record["input_path"], output_path=record["source_path"],
 							  message=f"Renamed source and {len(record['sidecars'])} sidecar(s)")
 	records.extend(new_records)
+	for record in new_records:
+		if record["status"] != "pending" or not record["is_reduced"]:
+			continue
+		record["status"] = "skipped_reduced"
+		record["message"] = "Reduced source ignored; source renamed, existing output left untouched, reprojection and repair skipped"
+		run_report.record("skip_reduced_source", "info", client=record["client"],
+					  project_or_job=record["job_number"], input_path=record["input_path"],
+					  output_path=record["source_path"], message=record["message"])
+	queue_items = []
+	for record in new_records:
+		if record["status"] != "pending" or not record["repair_reason"]:
+			continue
+		if record["output_path"].exists():
+			record["status"] = "skipped_invalid_same_name_output"
+			record["message"] = "Reserved output appeared after naming; left untouched"
+			run_report.record("check_existing_output", "warning", client=record["client"],
+				project_or_job=record["job_number"], input_path=record["source_path"],
+				output_path=record["output_path"], message=record["message"])
+			continue
+		queue_items.append({"source_path": str(record["source_path"].absolute()),
+			"output_path": str(record["output_path"].absolute()), "client": str(record["client"]),
+			"job_number": str(record["job_number"]), "reason": record["repair_reason"]})
+		record["status"] = "queued_for_repair"
+		record["message"] = record["repair_reason"]
+	if queue_path is not None:
+		publish_repair_queue(queue_path, run_id, queue_items)
+		for record in new_records:
+			if record["status"] == "queued_for_repair":
+				run_report.record("queue_repair", "info", client=record["client"],
+					project_or_job=record["job_number"], input_path=record["source_path"],
+					output_path=record["output_path"], message=record["message"])
 
 	processed = 0
 	skipped = 0
 	already_done = 0
 	collision_count = 0
 	naming_review_count = 0
+	queued_count = 0
+	reduced_skipped = 0
 
 	with REPORT_CSV.open("w", newline="", encoding="utf-8-sig") as report_handle:
 		writer = csv.DictWriter(
@@ -571,7 +789,7 @@ def main():
 			status = record["status"]
 			message = record["message"]
 			name_note = record.get("name_note", "")
-			if status == "pending" and name_note:
+			if status in {"pending", "queued_for_repair"} and name_note:
 				naming_review_count += 1
 				print(f"NAME REVIEW: {src_tif}: {name_note}")
 				run_report.record("name_output_tif", "warning", client=client_code,
@@ -580,11 +798,17 @@ def main():
 			if status == "skipped_already_exists":
 				print(f"Already reprojected, skipping without changes: {output_path}\n")
 				already_done += 1
+			elif status == "skipped_reduced":
+				print(f"Reduced source renamed; reprojection skipped: {src_tif}\n")
+				reduced_skipped += 1
+			elif status == "queued_for_repair":
+				queued_count += 1
+				print(f"Queued for repair: {src_tif} -> {output_path}: {message}")
 			elif status == "pending":
 				try:
 					if output_path.exists():
 						raise FileExistsError(f"Refusing to overwrite an existing output: {output_path}")
-					if create_cog_from_tif(src_tif, output_path, TARGET_CRS_CODE):
+					if create_cog_without_overwrite(src_tif, output_path, TARGET_CRS_CODE):
 						print(f"Done: {output_path}\n")
 						processed += 1
 						status = "completed"
@@ -608,10 +832,10 @@ def main():
 					run_report.exception("reprojection", error, client=client_code,
 									 project_or_job=job_number, data_type=type_tag,
 									 input_path=src_tif, output_path=output_path)
-			elif status not in {"skipped_name_collision", "skipped_invalid_name", "skipped_invalid_same_name_output"}:
+			elif status not in {"failed", "skipped_reduced", "skipped_name_collision", "skipped_invalid_name", "skipped_invalid_same_name_output"}:
 				status = "skipped"
 
-			if status in {"skipped_name_collision", "skipped_invalid_name", "skipped_invalid_same_name_output"}:
+			if status in {"failed", "skipped_name_collision", "skipped_invalid_name", "skipped_invalid_same_name_output"} and record["status"] != "pending":
 				skipped += 1
 			if status == "skipped_name_collision":
 				collision_count += 1
@@ -632,11 +856,13 @@ def main():
 	print(
 		f"\nFinished: {processed} COG files created, "
 		f"{already_done} already done, {skipped} skipped, "
-		f"{collision_count} naming collisions, {naming_review_count} naming review(s)"
+		f"{reduced_skipped} Reduced source(s) ignored, {collision_count} naming collisions, "
+		f"{naming_review_count} naming review(s), {queued_count} queued for repair"
 	)
-	run_report.record("run", "completed" if skipped == 0 else "completed_with_issues",
+	run_report.record("run", "completed" if run_report.issue_count == 0 else "completed_with_issues",
 				  message=(f"processed={processed}; already_done={already_done}; skipped={skipped}; "
-						   f"name_collisions={collision_count}; naming_reviews={naming_review_count}"),
+						   f"reduced_ignored={reduced_skipped}; name_collisions={collision_count}; "
+						   f"naming_reviews={naming_review_count}; queued_for_repair={queued_count}"),
 				  output_path=REPORT_CSV)
 	return 1 if run_report.issue_count else 0
 
