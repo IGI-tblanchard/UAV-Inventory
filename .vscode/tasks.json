@@ -1,0 +1,12 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run UAV orthomosaic mosaic only",
+			"type": "shell",
+			"command": "& 'C:\\Program Files\\ArcGIS\\Pro\\bin\\Python\\Scripts\\propy.bat' 'C:\\Users\\tblanchard\\Documents\\Tracy\\Code\\UAV Updates\\UAV-Inventory\\2_UAV_ortho_to_mosaic_nightly.py'",
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}

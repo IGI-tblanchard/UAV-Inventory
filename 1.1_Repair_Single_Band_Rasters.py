@@ -7,6 +7,7 @@ black or white pixel values. Scratch files are kept outside mosaic discovery.
 
 import csv
 import json
+import math
 import os
 import re
 import sys
@@ -14,6 +15,7 @@ import tempfile
 import uuid
 from collections import Counter
 from pathlib import Path
+from xml.etree import ElementTree
 
 from task_run_report import RunReport
 
@@ -31,8 +33,18 @@ def configure_gdal():
     gdal.SetConfigOption("GDAL_PAM_ENABLED", "YES")
     gdal.SetConfigOption("GDAL_CACHEMAX", "512")
     gdal.SetConfigOption("GDAL_NUM_THREADS", "ALL_CPUS")
-    if gdal.GetDriverByName("COG") is None:
+    driver = gdal.GetDriverByName("COG")
+    if driver is None:
         raise RuntimeError("GDAL COG driver is unavailable")
+    options = driver.GetMetadataItem("DMD_CREATIONOPTIONLIST") or ""
+    try:
+        supported = any(option.get("name") == "STATISTICS" and
+                        any(value.text == "YES" for value in option.findall("Value"))
+                        for option in ElementTree.fromstring(options).findall("Option"))
+    except ElementTree.ParseError as error:
+        raise RuntimeError("Cannot inspect COG driver creation options") from error
+    if not supported:
+        raise RuntimeError("GDAL COG driver does not support STATISTICS=YES")
     return gdal, osr, np
 
 
@@ -219,16 +231,54 @@ def validate_cog(path, gdal, osr):
         if any(ds.GetRasterBand(i).GetBlockSize() != [512, 512] for i in range(1, 5)):
             raise ValueError("Output block size is not 512 by 512")
         # Decode every block, not just the TIFF header, before publishing.
+        has_visible_pixels = False
         for y in range(0, ds.RasterYSize, 512):
             for x in range(0, ds.RasterXSize, 512):
-                if ds.ReadRaster(x, y, min(512, ds.RasterXSize - x),
-                                 min(512, ds.RasterYSize - y)) is None:
+                width, height = min(512, ds.RasterXSize - x), min(512, ds.RasterYSize - y)
+                if ds.ReadRaster(x, y, width, height) is None:
                     raise ValueError("Could not decode output block")
+                if not has_visible_pixels:
+                    alpha = ds.GetRasterBand(4).ReadRaster(x, y, width, height)
+                    if alpha is None:
+                        raise ValueError("Could not decode output alpha block")
+                    has_visible_pixels = any(alpha)
+        if not has_visible_pixels:
+            raise ValueError("Output is entirely transparent; RGB statistics cannot be validated")
         files = ds.GetFileList() or []
         if len(files) != 1:
             raise ValueError(f"Output depends on unexpected sidecars: {files}")
     finally:
         ds = None
+
+
+def validate_internal_statistics(path, gdal):
+    """Check persisted per-band statistics without PAM sidecars or recomputation."""
+    old_pam = gdal.GetThreadLocalConfigOption("GDAL_PAM_ENABLED", None)
+    dataset = None
+    try:
+        gdal.SetThreadLocalConfigOption("GDAL_PAM_ENABLED", "NO")
+        dataset = gdal.Open(str(path), gdal.GA_ReadOnly)
+        if dataset is None:
+            raise ValueError("Cannot reopen COG to inspect internal statistics")
+        if dataset.RasterCount != 4:
+            raise ValueError("Cannot inspect statistics: output does not have four bands")
+        keys = ("STATISTICS_MINIMUM", "STATISTICS_MAXIMUM", "STATISTICS_MEAN", "STATISTICS_STDDEV")
+        for index in range(1, 5):
+            metadata = dataset.GetRasterBand(index).GetMetadata()
+            try:
+                values = [float(metadata[key]) for key in keys]
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(f"Band {index} is missing valid internal statistics") from error
+            if not all(math.isfinite(value) for value in values):
+                raise ValueError(f"Band {index} has non-finite internal statistics")
+            minimum, maximum, mean, stddev = values
+            if minimum > maximum or not minimum <= mean <= maximum or stddev < 0:
+                raise ValueError(f"Band {index} has inconsistent internal statistics")
+            if metadata.get("STATISTICS_APPROXIMATE", "NO").upper() in {"YES", "TRUE", "1"}:
+                raise ValueError(f"Band {index} has approximate statistics")
+    finally:
+        dataset = None
+        gdal.SetThreadLocalConfigOption("GDAL_PAM_ENABLED", old_pam)
 
 
 def publish_no_replace(temp, output):
@@ -265,16 +315,21 @@ def repair(source, output, gdal, osr, np):
                     srcAlpha=True, dstAlpha=True, multithread=True,
                     creationOptions=["COMPRESS=LZW", "PREDICTOR=2", "BLOCKSIZE=512",
                                      "BIGTIFF=IF_SAFER", "NUM_THREADS=ALL_CPUS",
-                                     f"OVERVIEW_RESAMPLING={overview}"]))
+                                     f"OVERVIEW_RESAMPLING={overview}", "STATISTICS=YES"]))
                 if warped is None:
                     raise RuntimeError("GDAL warp failed")
                 warped.FlushCache()
             finally:
                 warped = None
             validate_cog(cog, gdal, osr)
+            validate_internal_statistics(cog, gdal)
+            # Do not publish a TIFF whose metadata or masks depend on sidecars.
+            ensure_free_output_sidecars = (Path(str(cog) + suffix) for suffix in (".aux.xml", ".msk", ".ovr"))
+            if any(os.path.lexists(sidecar) for sidecar in ensure_free_output_sidecars):
+                raise ValueError("Output COG has unexpected sidecars")
             ensure_free_output(output)
             publish_no_replace(cog, output)
-        return f"{kind} Byte to RGBA COG; resampling={algorithm}"
+        return f"{kind} Byte to RGBA COG; resampling={algorithm}; internal band statistics included"
     finally:
         src = None
 

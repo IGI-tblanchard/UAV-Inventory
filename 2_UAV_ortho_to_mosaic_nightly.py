@@ -2,8 +2,10 @@ import csv
 import sys
 import time
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
 
+from mosaic_maintenance_state import MaintenanceState, force_maintenance, state_directory
 from task_run_report import RunReport
 
 run_report = RunReport(__file__)
@@ -47,15 +49,48 @@ def log(message):
 	print(f"[{timestamp}] {message}")
 
 
+@contextmanager
+def timed_stage(stage, **context):
+	"""Record flushed start and elapsed finish events without counting errors twice."""
+	start_time = time.perf_counter()
+	try:
+		run_report.record(stage, "started", message="Operation started", **context)
+	except Exception:
+		# Timing diagnostics must not prevent the original operation from running.
+		pass
+	try:
+		yield
+	except BaseException as error:
+		elapsed_seconds = time.perf_counter() - start_time
+		try:
+			run_report.record(stage, "info", message="Operation ended with an error",
+						  details=f"elapsed_seconds={elapsed_seconds:.2f}; error={type(error).__name__}: {error}",
+						  **context)
+		except Exception:
+			# Preserve the original processing exception if diagnostics also fail.
+			pass
+		raise
+	else:
+		elapsed_seconds = time.perf_counter() - start_time
+		try:
+			run_report.record(stage, "completed", message="Operation finished",
+							  details=f"elapsed_seconds={elapsed_seconds:.2f}", **context)
+		except Exception:
+			# Timing diagnostics must not change the original operation's result.
+			pass
+
+
 def mosaic_name_for(client_folder):
 	return f"{client_folder}_{MOSAIC_SUFFIX}"
 
 
-def iter_output_tifs():
+def iter_output_tifs(unavailable_clients=None):
 	"""Yield reprojected Mosaic TIFFs in each client's immediate job folders."""
 	for client_code, client_folder in CLIENT_FOLDERS.items():
 		client_root = BASE_DIR / client_folder / SOURCE_SUBDIRECTORY
 		if not client_root.is_dir():
+			if unavailable_clients is not None:
+				unavailable_clients.add(client_folder)
 			log(f"Source directory not found, skipping: {client_root}")
 			run_report.record("discover_client_root", "warning", client=client_folder,
 						  input_path=client_root, message="Client source root is missing or inaccessible")
@@ -88,10 +123,12 @@ def mosaic_item_paths(mosaic_dataset_path):
 	"""Export and read each mosaic item's actual source raster path by OID."""
 	mosaic_path = Path(mosaic_dataset_path)
 	catalog_path = mosaic_path.parent / f"AMD_{mosaic_path.name}_CAT"
-	if not arcpy.Exists(str(catalog_path)):
-		raise FileNotFoundError(f"Mosaic footprint catalog not found: {catalog_path}")
+	with timed_stage("mosaic_catalog_discovery_timing", output_path=catalog_path):
+		if not arcpy.Exists(str(catalog_path)):
+			raise FileNotFoundError(f"Mosaic footprint catalog not found: {catalog_path}")
 
-	item_count = int(arcpy.management.GetCount(mosaic_dataset_path).getOutput(0))
+	with timed_stage("mosaic_path_count_timing", output_path=mosaic_dataset_path):
+		item_count = int(arcpy.management.GetCount(mosaic_dataset_path).getOutput(0))
 	if item_count == 0:
 		message = "Mosaic contains no items; skipping path export and treating existing paths as empty"
 		log(f"{message}: {mosaic_dataset_path}")
@@ -99,37 +136,45 @@ def mosaic_item_paths(mosaic_dataset_path):
 					  output_path=mosaic_dataset_path, message=message)
 		return {}
 
-	output_table = arcpy.CreateUniqueName(f"uav_paths_{mosaic_path.name}", str(mosaic_path.parent))
+	with timed_stage("create_mosaic_path_table_name_timing", output_path=mosaic_dataset_path):
+		output_table = arcpy.CreateUniqueName(f"uav_paths_{mosaic_path.name}", str(mosaic_path.parent))
 	try:
-		arcpy.management.ExportMosaicDatasetPaths(
-			in_mosaic_dataset=mosaic_dataset_path,
-			out_table=output_table,
-			export_mode="ALL",
-			types_of_paths="RASTER",
-		)
-		output_fields = {field.name.casefold(): field.name for field in arcpy.ListFields(output_table)}
-		source_oid_field = output_fields.get("sourceoid")
-		path_field = output_fields.get("path")
-		if not source_oid_field or not path_field:
-			raise RuntimeError(f"Exported mosaic path table is missing SourceOID/Path fields: {output_table}")
+		with timed_stage("export_mosaic_paths_timing", input_path=mosaic_dataset_path,
+						 output_path=output_table):
+			arcpy.management.ExportMosaicDatasetPaths(
+				in_mosaic_dataset=mosaic_dataset_path,
+				out_table=output_table,
+				export_mode="ALL",
+				types_of_paths="RASTER",
+			)
+		with timed_stage("read_mosaic_paths_timing", input_path=output_table,
+						 output_path=mosaic_dataset_path):
+			output_fields = {field.name.casefold(): field.name for field in arcpy.ListFields(output_table)}
+			source_oid_field = output_fields.get("sourceoid")
+			path_field = output_fields.get("path")
+			if not source_oid_field or not path_field:
+				raise RuntimeError(f"Exported mosaic path table is missing SourceOID/Path fields: {output_table}")
 
-		item_paths = {}
-		with arcpy.da.SearchCursor(output_table, [source_oid_field, path_field]) as cursor:
-			for source_oid, source_path in cursor:
-				if source_path:
-					item_paths.setdefault(source_oid, str(source_path))
+			item_paths = {}
+			with arcpy.da.SearchCursor(output_table, [source_oid_field, path_field]) as cursor:
+				for source_oid, source_path in cursor:
+					if source_path:
+						item_paths.setdefault(source_oid, str(source_path))
 		return item_paths
 	finally:
-		if arcpy.Exists(output_table):
-			arcpy.management.Delete(output_table)
+		with timed_stage("cleanup_mosaic_paths_timing", input_path=output_table,
+						 output_path=mosaic_dataset_path):
+			if arcpy.Exists(output_table):
+				arcpy.management.Delete(output_table)
 
 
-def add_tifs_to_mosaic(mosaic_dataset_path, tif_rows, writer, report_handle):
+def add_tifs_to_mosaic(mosaic_dataset_path, tif_rows, writer, report_handle, maintenance_store=None):
 	"""Skip catalog paths and add each remaining TIFF independently."""
 	added_count = 0
 	failed_count = 0
 	try:
-		item_paths = mosaic_item_paths(mosaic_dataset_path)
+		with timed_stage("check_existing_mosaic_paths_timing", output_path=mosaic_dataset_path):
+			item_paths = mosaic_item_paths(mosaic_dataset_path)
 	except Exception as path_error:
 		message = f"Could not read existing mosaic source paths: {path_error}"
 		log(f"Cannot safely check {mosaic_dataset_path}; skipping its TIFFs")
@@ -173,18 +218,24 @@ def add_tifs_to_mosaic(mosaic_dataset_path, tif_rows, writer, report_handle):
 	if pending_rows:
 		log(f"Adding {len(pending_rows)} new TIFF(s) individually to {mosaic_dataset_path}")
 		for client_code, client_folder, job_number, tif_path in pending_rows:
+			# Persistence failures must propagate before the add can mutate production.
+			if maintenance_store is not None:
+				maintenance_store.mark_pending(mosaic_dataset_path, "production raster add attempted")
 			try:
-				arcpy.management.AddRastersToMosaicDataset(
-					in_mosaic_dataset=mosaic_dataset_path,
-					raster_type="Raster Dataset",
-					input_path=str(tif_path),
-					update_cellsize_ranges="NO_CELL_SIZES",
-					update_boundary="NO_BOUNDARY",
-					update_overviews="NO_OVERVIEWS",
-					duplicate_items_action="EXCLUDE_DUPLICATES",
-					calculate_statistics="NO_STATISTICS",
-					build_pyramids="NO_PYRAMIDS",
-				)
+				with timed_stage("add_raster_timing", client=client_folder,
+								 project_or_job=job_number, input_path=tif_path,
+								 output_path=mosaic_dataset_path):
+					arcpy.management.AddRastersToMosaicDataset(
+						in_mosaic_dataset=mosaic_dataset_path,
+						raster_type="Raster Dataset",
+						input_path=str(tif_path),
+						update_cellsize_ranges="NO_CELL_SIZES",
+						update_boundary="NO_BOUNDARY",
+						update_overviews="NO_OVERVIEWS",
+						duplicate_items_action="EXCLUDE_DUPLICATES",
+						calculate_statistics="NO_STATISTICS",
+						build_pyramids="NO_PYRAMIDS",
+					)
 			except Exception as add_error:
 				failed_count += 1
 				error_message = arcpy.GetMessages(2) or str(add_error)
@@ -206,53 +257,56 @@ def add_tifs_to_mosaic(mosaic_dataset_path, tif_rows, writer, report_handle):
 			report_handle.flush()
 
 		if successful_rows:
-			verify_error_message = ""
-			try:
-				item_paths = mosaic_item_paths(mosaic_dataset_path)
-			except Exception as verify_error:
-				item_paths = None
-				verify_error_message = str(verify_error)
-				log(f"Could not verify added TIFFs in {mosaic_dataset_path}: {verify_error}")
-				run_report.exception("verify_mosaic_additions", verify_error,
-								  output_path=mosaic_dataset_path)
+			with timed_stage("verify_mosaic_additions_timing", output_path=mosaic_dataset_path):
+				verify_error_message = ""
+				try:
+					with timed_stage("verify_mosaic_paths_timing", output_path=mosaic_dataset_path):
+						item_paths = mosaic_item_paths(mosaic_dataset_path)
+				except Exception as verify_error:
+					item_paths = None
+					verify_error_message = str(verify_error)
+					log(f"Could not verify added TIFFs in {mosaic_dataset_path}: {verify_error}")
+					run_report.exception("verify_mosaic_additions", verify_error,
+									  output_path=mosaic_dataset_path)
 
-			verified_paths = (
-				{normalize_raster_path(path) for path in item_paths.values()}
-				if item_paths is not None
-				else set()
-			)
-			for client_code, job_number, tif_path in successful_rows:
-				if item_paths is None:
-					status = "verification_failed"
-					message = f"Add tool succeeded, but catalog verification failed: {verify_error_message}"
-					failed_count += 1
-				elif normalize_raster_path(tif_path) in verified_paths:
-					status = "added"
-					message = ""
-					added_count += 1
-				else:
-					status = "verification_failed"
-					message = "Add tool succeeded, but source path is absent from the mosaic catalog"
-					failed_count += 1
-				writer.writerow({
-					"client": client_code,
-					"job_number": job_number,
-					"tif_path": str(tif_path),
-					"mosaic_dataset": mosaic_dataset_path,
-					"status": status,
-					"message": message,
-				})
-				run_report.record("verify_mosaic_addition", status, client=client_folder,
-							  project_or_job=job_number, input_path=tif_path,
-							  output_path=mosaic_dataset_path,
-							  message=message or "Source path found in mosaic catalog")
-			report_handle.flush()
+				verified_paths = (
+					{normalize_raster_path(path) for path in item_paths.values()}
+					if item_paths is not None
+					else set()
+				)
+				for client_code, job_number, tif_path in successful_rows:
+					if item_paths is None:
+						status = "verification_failed"
+						message = f"Add tool succeeded, but catalog verification failed: {verify_error_message}"
+						failed_count += 1
+					elif normalize_raster_path(tif_path) in verified_paths:
+						status = "added"
+						message = ""
+						added_count += 1
+					else:
+						status = "verification_failed"
+						message = "Add tool succeeded, but source path is absent from the mosaic catalog"
+						failed_count += 1
+					writer.writerow({
+						"client": client_code,
+						"job_number": job_number,
+						"tif_path": str(tif_path),
+						"mosaic_dataset": mosaic_dataset_path,
+						"status": status,
+						"message": message,
+					})
+					run_report.record("verify_mosaic_addition", status, client=client_folder,
+								  project_or_job=job_number, input_path=tif_path,
+								  output_path=mosaic_dataset_path,
+								  message=message or "Source path found in mosaic catalog")
+				report_handle.flush()
 	else:
 		log(f"No new TIFFs to add to {mosaic_dataset_path}")
 
 	if item_paths is not None:
 		try:
-			update_footprint_attributes(mosaic_dataset_path, item_paths)
+			with timed_stage("update_catalog_attributes_timing", output_path=mosaic_dataset_path):
+				update_footprint_attributes(mosaic_dataset_path, item_paths)
 		except Exception as update_error:
 			log(f"Failed updating mosaic Path/FolderPath fields: {update_error}")
 			run_report.exception("update_catalog_attributes", update_error,
@@ -267,8 +321,9 @@ def add_tifs_to_mosaic(mosaic_dataset_path, tif_rows, writer, report_handle):
 		f"Failed: {failed_count}, Already present: {len(tif_rows) - len(pending_rows)}"
 	)
 	try:
-		result = arcpy.management.GetCount(mosaic_dataset_path)
-		log(f"Mosaic item count: {int(result.getOutput(0))}")
+		with timed_stage("final_mosaic_count_timing", output_path=mosaic_dataset_path):
+			result = arcpy.management.GetCount(mosaic_dataset_path)
+			log(f"Mosaic item count: {int(result.getOutput(0))}")
 	except Exception:
 		log("Mosaic item count: unavailable")
 
@@ -313,13 +368,14 @@ def update_footprint_attributes(mosaic_dataset_path, item_paths):
 def build_production_overviews(mosaic_dataset_path):
 	"""Define and regenerate all overviews for a production mosaic dataset."""
 	try:
-		arcpy.management.BuildOverviews(
-			in_mosaic_dataset=mosaic_dataset_path,
-			define_missing_tiles="DEFINE_MISSING_TILES",
-			generate_overviews="GENERATE_OVERVIEWS",
-			generate_missing_images="GENERATE_MISSING_IMAGES",
-			regenerate_stale_images="REGENERATE_STALE_IMAGES",
-		)
+		with timed_stage("build_production_overviews_timing", output_path=mosaic_dataset_path):
+			arcpy.management.BuildOverviews(
+				in_mosaic_dataset=mosaic_dataset_path,
+				define_missing_tiles="DEFINE_MISSING_TILES",
+				generate_overviews="GENERATE_OVERVIEWS",
+				generate_missing_images="GENERATE_MISSING_IMAGES",
+				regenerate_stale_images="REGENERATE_STALE_IMAGES",
+			)
 		log(f"Production overviews generated: {mosaic_dataset_path}")
 		run_report.record("build_production_overviews", "completed", output_path=mosaic_dataset_path,
 					  message="Production overview build completed")
@@ -332,25 +388,53 @@ def build_production_overviews(mosaic_dataset_path):
 
 
 def main():
+	store = MaintenanceState(state_directory())
+	with store.lock():
+		return run_locked(store, force_maintenance())
+
+
+def run_locked(store, force):
 	start_time = time.perf_counter()
 	log("Starting Add TIFFs To Orthomosaic process")
 	run_report.record("run", "started", message="Orthomosaic mosaic update started",
 				  details=f"BASE_DIR={BASE_DIR}; staging={STAGING_GDB}; production={PRODUCTION_GDB}")
 
+	# Initialize every existing scoped production mosaic before input discovery.
+	with timed_stage("discover_geodatabase_timing", output_path=PRODUCTION_GDB):
+		production_exists = arcpy.Exists(str(PRODUCTION_GDB))
+	if not production_exists:
+		run_report.record("check_geodatabase", "failed", issue_category="path_or_network",
+						  output_path=PRODUCTION_GDB, message="Geodatabase does not exist or is inaccessible")
+		raise FileNotFoundError(f"Production geodatabase not found: {PRODUCTION_GDB}")
+
+	production_mosaics = {}
+	for client_folder in CLIENT_FOLDERS.values():
+		mosaic_name = mosaic_name_for(client_folder)
+		if (client_folder, mosaic_name) not in MOSAIC_SCOPE:
+			continue
+		mosaic_dataset_path = str(PRODUCTION_GDB / mosaic_name)
+		with timed_stage("discover_mosaic_dataset_timing", client=client_folder,
+						 output_path=mosaic_dataset_path):
+			mosaic_exists = arcpy.Exists(mosaic_dataset_path)
+		if mosaic_exists:
+			store.ensure(mosaic_dataset_path, force=force)
+			production_mosaics[mosaic_dataset_path] = {"client": client_folder, "failed": 0}
+
 	grouped = {}
-	for client_code, client_folder, job_number, mosaic_name, tif_path in iter_output_tifs():
-		grouped.setdefault((client_folder, mosaic_name), []).append(
-			(client_code, client_folder, job_number, tif_path)
-		)
+	unavailable_clients = set()
+	with timed_stage("discover_mosaic_inputs_timing", input_path=BASE_DIR):
+		for client_code, client_folder, job_number, mosaic_name, tif_path in iter_output_tifs(unavailable_clients):
+			grouped.setdefault((client_folder, mosaic_name), []).append(
+				(client_code, client_folder, job_number, tif_path)
+			)
 
 	if not grouped:
-		run_report.record("discover_inputs", "failed", issue_category="path_or_network",
-					  input_path=BASE_DIR, message="No reprojected Mosaic TIFFs found")
-		raise ValueError(f"No reprojected Mosaic TIFFs found under {BASE_DIR}")
+		log(f"No reprojected Mosaic TIFFs found under {BASE_DIR}; checking pending maintenance")
+		run_report.record("discover_inputs", "info", input_path=BASE_DIR,
+					  message="No reprojected Mosaic TIFFs found; checking pending maintenance")
 
 	total_added = 0
 	total_failed = 0
-	production_mosaics_to_overview = set()
 	with REPORT_CSV.open("w", newline="", encoding="utf-8-sig") as report_handle:
 		writer = csv.DictWriter(
 			report_handle,
@@ -360,7 +444,12 @@ def main():
 
 		for target_name, gdb_path in (("staging", STAGING_GDB), ("production", PRODUCTION_GDB)):
 			log(f"Starting {target_name} geodatabase update: {gdb_path}")
-			if not arcpy.Exists(str(gdb_path)):
+			if target_name == "production":
+				gdb_exists = production_exists
+			else:
+				with timed_stage("discover_geodatabase_timing", output_path=gdb_path):
+					gdb_exists = arcpy.Exists(str(gdb_path))
+			if not gdb_exists:
 				log(f"Geodatabase not found, skipping: {gdb_path}")
 				run_report.record("check_geodatabase", "failed", issue_category="path_or_network",
 							  output_path=gdb_path, message="Geodatabase does not exist or is inaccessible")
@@ -377,15 +466,19 @@ def main():
 				mosaic_dataset_path = str(gdb_path / mosaic_name)
 
 				if not tif_rows:
-					log(f"No TIFFs found for {client_folder} / {mosaic_name}, skipping")
+					log(f"No TIFFs found for {client_folder} / {mosaic_name}, skipping ingestion")
 					run_report.record("discover_mosaic_inputs", "info", client=client_folder,
 								  output_path=mosaic_dataset_path,
-								  message="No candidate TIFFs for this mosaic on this run; skipped")
-					if target_name == "production" and arcpy.Exists(mosaic_dataset_path):
-						production_mosaics_to_overview.add(mosaic_dataset_path)
+								  message="No candidate TIFFs for this mosaic on this run; ingestion skipped")
 					continue
 
-				if not arcpy.Exists(mosaic_dataset_path):
+				if target_name == "production":
+					mosaic_exists = mosaic_dataset_path in production_mosaics
+				else:
+					with timed_stage("discover_mosaic_dataset_timing", client=client_folder,
+									 output_path=mosaic_dataset_path):
+						mosaic_exists = arcpy.Exists(mosaic_dataset_path)
+				if not mosaic_exists:
 					log(f"Mosaic dataset not found, skipping: {mosaic_dataset_path}")
 					run_report.record("check_mosaic_dataset", "failed", client=client_folder,
 								  output_path=mosaic_dataset_path,
@@ -396,30 +489,41 @@ def main():
 						)
 					continue
 
-				if target_name == "production":
-					production_mosaics_to_overview.add(mosaic_dataset_path)
-
 				log(f"Found {len(tif_rows)} TIFFs for {mosaic_dataset_path}")
-				added_count, failed_count = add_tifs_to_mosaic(
-					mosaic_dataset_path,
-					tif_rows,
-					writer,
-					report_handle,
-				)
+				with timed_stage("mosaic_update_timing", client=client_folder,
+								 output_path=mosaic_dataset_path):
+					added_count, failed_count = add_tifs_to_mosaic(
+						mosaic_dataset_path,
+						tif_rows,
+						writer,
+						report_handle,
+						maintenance_store=store if target_name == "production" else None,
+					)
 				total_added += added_count
 				total_failed += failed_count
+				if target_name == "production":
+					production_mosaics[mosaic_dataset_path]["failed"] = failed_count
 
 			if target_name == "production":
-				for mosaic_dataset_path in sorted(production_mosaics_to_overview):
-					build_production_overviews(mosaic_dataset_path)
+				for mosaic_dataset_path, mosaic_result in sorted(production_mosaics.items()):
+					if mosaic_result["client"] in unavailable_clients:
+						store.mark_pending(mosaic_dataset_path, "production input discovery uncertain")
+					if not store.is_pending(mosaic_dataset_path):
+						log(f"Maintenance not pending; skipping production overviews: {mosaic_dataset_path}")
+						continue
+					if build_production_overviews(mosaic_dataset_path):
+						if mosaic_result["failed"] or mosaic_result["client"] in unavailable_clients:
+							log(f"Keeping maintenance pending after mosaic update or discovery issues: {mosaic_dataset_path}")
+						else:
+							store.clear(mosaic_dataset_path)
 
 	log(f"Report written: {REPORT_CSV}")
 	elapsed_seconds = time.perf_counter() - start_time
 	log(f"Finished: {total_added} added, {total_failed} failed, in {elapsed_seconds:.2f} seconds")
-	run_report.record("run", "completed" if run_report.issue_count == 0 else "completed_with_issues",
+	run_report.record("run", "completed" if run_report.issue_count == 0 and total_failed == 0 else "completed_with_issues",
 				  message=f"added={total_added}; failed={total_failed}; elapsed_seconds={elapsed_seconds:.2f}",
 				  output_path=REPORT_CSV)
-	return 1 if run_report.issue_count else 0
+	return 1 if run_report.issue_count or total_failed else 0
 
 
 if __name__ == "__main__":

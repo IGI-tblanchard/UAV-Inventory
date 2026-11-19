@@ -1,3 +1,5 @@
+param([switch]$ForceMaintenance)
+
 $ErrorActionPreference = 'Stop'
 
 $propy = 'C:\Program Files\ArcGIS\Pro\bin\Python\Scripts\propy.bat'
@@ -19,7 +21,7 @@ $scripts = @(
     '2_UAV_ortho_to_mosaic_nightly.py'
 )
 
-$environmentNames = @('UAV_REPORT_DIR', 'UAV_REPAIR_RUN_ID', 'UAV_REPAIR_QUEUE')
+$environmentNames = @('UAV_REPORT_DIR', 'UAV_REPAIR_RUN_ID', 'UAV_REPAIR_QUEUE', 'UAV_FORCE_MAINTENANCE')
 $originalEnvironment = @{}
 foreach ($name in $environmentNames) {
     $originalEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
@@ -92,11 +94,15 @@ try {
     $env:UAV_REPORT_DIR = $reportRoot
     $env:UAV_REPAIR_RUN_ID = $runId
     $env:UAV_REPAIR_QUEUE = $queuePath
+    if ($ForceMaintenance) {
+        $env:UAV_FORCE_MAINTENANCE = 'true'
+    }
     Write-Output "Started UAV nightly workflow: $(Get-Date -Format o)"
     Write-Output "Python launcher: $propy"
     Write-Output "Working folder: $scriptRoot"
     Write-Output "Repair run ID: $runId"
     Write-Output "Repair queue: $queuePath"
+    Write-Output "Force maintenance: $ForceMaintenance; environment override: $env:UAV_FORCE_MAINTENANCE"
     Write-Output "UNC data share check: $(Test-Path -LiteralPath $dataRoot)"
 
     if (-not (Test-Path -LiteralPath $propy -PathType Leaf)) {

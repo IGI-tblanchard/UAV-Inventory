@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 from xml.sax.saxutils import escape
 
 import numpy as np
@@ -79,6 +80,34 @@ class RepairConsumerTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def assert_internal_statistics_match_pixels(self, output):
+        previous = gdal.GetThreadLocalConfigOption("GDAL_PAM_ENABLED", None)
+        ds = None
+        try:
+            gdal.SetThreadLocalConfigOption("GDAL_PAM_ENABLED", "NO")
+            ds = gdal.Open(str(output))
+            self.assertEqual(ds.GetMetadata("IMAGE_STRUCTURE").get("LAYOUT"), "COG")
+            for index in range(1, 5):
+                band = ds.GetRasterBand(index)
+                pixels = band.ReadAsArray()
+                valid = band.GetMaskBand().ReadAsArray() != 0
+                values = pixels[valid].astype(np.float64)
+                self.assertGreater(values.size, 0)
+                metadata = band.GetMetadata()
+                self.assertNotEqual(metadata.get("STATISTICS_APPROXIMATE"), "YES")
+                for key, expected in (("STATISTICS_MINIMUM", values.min()),
+                                      ("STATISTICS_MAXIMUM", values.max()),
+                                      ("STATISTICS_MEAN", values.mean()),
+                                      ("STATISTICS_STDDEV", values.std())):
+                    self.assertIn(key, metadata)
+                    self.assertAlmostEqual(float(metadata[key]), float(expected), places=5)
+            band = None
+        finally:
+            ds = None
+            gdal.SetThreadLocalConfigOption("GDAL_PAM_ENABLED", previous)
+        for suffix in (".aux.xml", ".msk", ".ovr"):
+            self.assertFalse(Path(str(output) + suffix).exists())
+
     def test_palette_alpha_mask_nodata_and_valid_black_white(self):
         source = create_palette_vrt(self.root)
         output = self.root / "out.tif"
@@ -93,6 +122,7 @@ class RepairConsumerTests(unittest.TestCase):
         self.assertEqual(int(pixels[3, 0, 3]), 64)
         self.assertEqual(int(pixels[3, 1, 0]), 0)
         ds = None
+        self.assert_internal_statistics_match_pixels(output)
 
     def test_rgb_alpha_mask_nodata_and_valid_black_white(self):
         source, output = self.root / "rgb.tif", self.root / "out.tif"
@@ -106,6 +136,7 @@ class RepairConsumerTests(unittest.TestCase):
         self.assertEqual(int(pixels[3, 0, 3]), 128)
         self.assertEqual(int(pixels[3, 1, 0]), 0)
         ds = None
+        self.assert_internal_statistics_match_pixels(output)
 
     def test_pam_nodata_is_read_and_sources_unchanged(self):
         source, output = self.root / "rgb.tif", self.root / "out.tif"
@@ -166,6 +197,60 @@ class RepairConsumerTests(unittest.TestCase):
         self.assertEqual(int(alpha[-1, -1]), 0)
         self.assertGreater(int(alpha[alpha.shape[0] // 2, alpha.shape[1] // 2]), 0)
         ds = None
+        self.assert_internal_statistics_match_pixels(output)
+
+    def test_statistics_cover_full_resolution_and_ignore_stale_source_statistics(self):
+        source, output = self.root / "large_rgb.tif", self.root / "out.tif"
+        ds = gdal.GetDriverByName("GTiff").Create(str(source), 513, 513, 3, gdal.GDT_Byte,
+                                                   options=["PHOTOMETRIC=RGB"])
+        ds.SetProjection(spatial_ref().ExportToWkt())
+        ds.SetGeoTransform((500000, 1, 0, 5700000, 0, -1))
+        for index in range(1, 4):
+            pixels = np.full((513, 513), 10 * index, dtype=np.uint8)
+            pixels[-1, -1] = 200 + index
+            band = ds.GetRasterBand(index)
+            band.WriteArray(pixels)
+            band.SetStatistics(1, 2, 1.5, 0.5)
+        band = None
+        ds = None
+
+        self.assertIn("statistics included", repair_module.repair(source, output, gdal, osr, np))
+        self.assert_internal_statistics_match_pixels(output)
+
+    def test_completely_transparent_raster_fails_without_publishing(self):
+        source, output = self.root / "transparent.tif", self.root / "out.tif"
+        create_rgb(source)
+        ds = gdal.Open(str(source), gdal.GA_Update)
+        ds.GetRasterBand(1).GetMaskBand().Fill(0)
+        ds = None
+        with self.assertRaisesRegex(ValueError, "entirely transparent"):
+            repair_module.repair(source, output, gdal, osr, np)
+        self.assertFalse(output.exists())
+        self.assertFalse(any(path.name.startswith(".uav_repair_") for path in self.root.iterdir()))
+
+    def test_missing_internal_statistics_refuses_publication_and_restores_pam(self):
+        source, output = self.root / "rgb.tif", self.root / "out.tif"
+        create_rgb(source)
+        no_stats = self.root / "no_stats.tif"
+        dataset = gdal.GetDriverByName("GTiff").Create(
+            str(no_stats), 2, 2, 4, gdal.GDT_Byte,
+            options=["PHOTOMETRIC=RGB", "ALPHA=YES"])
+        dataset = None
+        previous = gdal.GetThreadLocalConfigOption("GDAL_PAM_ENABLED", None)
+        try:
+            gdal.SetThreadLocalConfigOption("GDAL_PAM_ENABLED", "YES")
+            with self.assertRaisesRegex(ValueError, "missing valid internal statistics"):
+                repair_module.validate_internal_statistics(no_stats, gdal)
+            self.assertEqual(gdal.GetThreadLocalConfigOption("GDAL_PAM_ENABLED", None), "YES")
+        finally:
+            gdal.SetThreadLocalConfigOption("GDAL_PAM_ENABLED", previous)
+
+        with mock.patch.object(repair_module, "validate_internal_statistics",
+                               side_effect=ValueError("statistics missing")):
+            with self.assertRaisesRegex(ValueError, "statistics missing"):
+                repair_module.repair(source, output, gdal, osr, np)
+        self.assertFalse(output.exists())
+        self.assertFalse(any(path.name.startswith(".uav_repair_") for path in self.root.iterdir()))
 
     def test_other_raster_layouts_rejected(self):
         for count, dtype in [(2, gdal.GDT_Byte), (4, gdal.GDT_Byte), (3, gdal.GDT_UInt16)]:
